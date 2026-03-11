@@ -460,14 +460,14 @@ def inject_css():
 
     /* ── background ── */
     .stApp {
-        background: #0d0f14;
+        background: #0a1628;
         color: #e8e6df;
     }
 
     /* ── sidebar ── */
     section[data-testid="stSidebar"] {
-        background: #13161d !important;
-        border-right: 1px solid #2a2e3a;
+        background: #0d1d35 !important;
+        border-right: 1px solid #1e3050;
     }
     section[data-testid="stSidebar"] * {
         color: #c9c6be !important;
@@ -475,8 +475,8 @@ def inject_css():
 
     /* ── metric cards ── */
     .metric-card {
-        background: linear-gradient(135deg, #1a1e28 0%, #12151d 100%);
-        border: 1px solid #2a2e3a;
+        background: linear-gradient(135deg, #0f2040 0%, #0a1628 100%);
+        border: 1px solid #1e3050;
         border-radius: 12px;
         padding: 24px 28px;
         position: relative;
@@ -488,8 +488,8 @@ def inject_css():
         top: 0; left: 0; right: 0;
         height: 2px;
     }
-    .metric-card.green::before  { background: linear-gradient(90deg, #00e5a0, #00b37a); }
-    .metric-card.amber::before  { background: linear-gradient(90deg, #f5a623, #e8842a); }
+    .metric-card.green::before  { background: linear-gradient(90deg, #c9a84c, #e2c07a); }
+    .metric-card.amber::before  { background: linear-gradient(90deg, #c9a84c, #a07830); }
     .metric-card.red::before    { background: linear-gradient(90deg, #ff5e62, #d63031); }
 
     .metric-label {
@@ -497,7 +497,7 @@ def inject_css():
         font-weight: 600;
         letter-spacing: 2px;
         text-transform: uppercase;
-        color: #6b7080 !important;
+        color: #7a8aaa !important;
         margin-bottom: 8px;
     }
     .metric-value {
@@ -507,27 +507,27 @@ def inject_css():
         color: #f0ede6 !important;
         line-height: 1.1;
     }
-    .metric-card.green .metric-value { color: #00e5a0 !important; }
-    .metric-card.amber .metric-value { color: #f5a623 !important; }
+    .metric-card.green .metric-value { color: #c9a84c !important; }
+    .metric-card.amber .metric-value { color: #e2c07a !important; }
     .metric-card.red   .metric-value { color: #ff5e62 !important; }
 
     /* ── page title ── */
     .page-header {
         display: flex;
-        align-items: baseline;
-        gap: 14px;
-        margin-bottom: 8px;
+        align-items: center;
+        gap: 18px;
+        margin-bottom: 4px;
     }
     .page-title {
-        font-size: 32px;
+        font-size: 30px;
         font-weight: 800;
-        color: #f0ede6;
-        letter-spacing: -0.5px;
+        color: #c9a84c;
+        letter-spacing: 1px;
     }
     .page-subtitle {
         font-size: 13px;
-        color: #4a5068;
-        letter-spacing: 1.5px;
+        color: #7a8aaa;
+        letter-spacing: 2px;
         text-transform: uppercase;
     }
 
@@ -537,9 +537,9 @@ def inject_css():
         font-weight: 700;
         letter-spacing: 2.5px;
         text-transform: uppercase;
-        color: #4a5068;
+        color: #7a8aaa;
         padding: 20px 0 10px;
-        border-bottom: 1px solid #1e2230;
+        border-bottom: 1px solid #1e3050;
         margin-bottom: 16px;
     }
 
@@ -549,8 +549,8 @@ def inject_css():
 
     /* ── buttons ── */
     .stButton > button {
-        background: linear-gradient(135deg, #00c07f, #009f68) !important;
-        color: #fff !important;
+        background: linear-gradient(135deg, #c9a84c, #a07830) !important;
+        color: #0a1628 !important;
         border: none !important;
         border-radius: 8px !important;
         font-family: 'Syne', sans-serif !important;
@@ -566,32 +566,32 @@ def inject_css():
     .stNumberInput > div > div > input,
     .stSelectbox > div > div,
     .stDateInput > div > div > input {
-        background: #1a1e28 !important;
-        border: 1px solid #2a2e3a !important;
+        background: #0f2040 !important;
+        border: 1px solid #1e3050 !important;
         border-radius: 8px !important;
         color: #e8e6df !important;
     }
 
     /* ── divider ── */
-    hr { border-color: #1e2230 !important; }
+    hr { border-color: #1e3050 !important; }
 
     /* ── status badges ── */
-    .badge-paid    { background:#00c07f22; color:#00e5a0; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
-    .badge-pending { background:#f5a62322; color:#f5a623; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
+    .badge-paid    { background:#c9a84c22; color:#c9a84c; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
+    .badge-pending { background:#ff5e6222; color:#ff5e62; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
 
     /* ── GST card variants ── */
     .metric-card.blue::before   { background: linear-gradient(90deg, #4e9eff, #2979e8); }
     .metric-card.blue .metric-value { color: #4e9eff !important; }
     .metric-card.purple::before { background: linear-gradient(90deg, #b06aff, #8b3dff); }
     .metric-card.purple .metric-value { color: #b06aff !important; }
-    .metric-card.teal::before   { background: linear-gradient(90deg, #00d4c8, #009e94); }
-    .metric-card.teal .metric-value  { color: #00d4c8 !important; }
+    .metric-card.teal::before   { background: linear-gradient(90deg, #c9a84c, #e2c07a); }
+    .metric-card.teal .metric-value  { color: #c9a84c !important; }
 
     /* ── GST rule chip ── */
     .gst-chip {
         display: inline-block;
-        background: #1e2538;
-        border: 1px solid #2a2e3a;
+        background: #0f2040;
+        border: 1px solid #1e3050;
         border-radius: 6px;
         padding: 6px 14px;
         margin: 4px;
@@ -599,25 +599,44 @@ def inject_css():
         font-family: 'DM Mono', monospace;
         color: #c9c6be;
     }
-    .gst-chip .chip-rate { font-size: 18px; font-weight: 600; color: #f0ede6; }
-    .gst-chip .chip-label { font-size: 10px; color: #4a5068; letter-spacing: 1px; text-transform: uppercase; }
+    .gst-chip .chip-rate { font-size: 18px; font-weight: 600; color: #c9a84c; }
+    .gst-chip .chip-label { font-size: 10px; color: #7a8aaa; letter-spacing: 1px; text-transform: uppercase; }
 
     /* ── tab bar ── */
     .stTabs [data-baseweb="tab-list"] {
-        background: #13161d;
+        background: #0d1d35;
         border-radius: 10px;
         gap: 4px;
         padding: 4px;
     }
     .stTabs [data-baseweb="tab"] {
         border-radius: 8px !important;
-        color: #6b7080 !important;
+        color: #7a8aaa !important;
         font-weight: 600 !important;
     }
     .stTabs [aria-selected="true"] {
-        background: #1e2538 !important;
-        color: #e8e6df !important;
+        background: #1e3050 !important;
+        color: #c9a84c !important;
     }
+
+    /* ── logo header bar ── */
+    .logo-header {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        padding: 10px 0 16px;
+        border-bottom: 1px solid #1e3050;
+        margin-bottom: 20px;
+    }
+    .logo-header img {
+        height: 64px;
+        width: 64px;
+        border-radius: 10px;
+        object-fit: cover;
+    }
+    .logo-text-block { display: flex; flex-direction: column; }
+    .logo-title { font-size: 26px; font-weight: 800; color: #c9a84c; letter-spacing: 1px; }
+    .logo-sub   { font-size: 12px; color: #7a8aaa; letter-spacing: 2.5px; text-transform: uppercase; margin-top: 2px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -626,13 +645,29 @@ def inject_css():
 # 6. UI COMPONENTS
 # ─────────────────────────────────────────────
 
+def get_logo_base64() -> str:
+    logo_path = Path("Arthav_Logo_File.jpg")
+    if logo_path.exists():
+        with open(logo_path, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    return ""
+
+
 def render_header():
-    st.markdown("""
-    <div class="page-header">
-        <span class="page-title">🏗️ Arthav Infra LLP</span>
+    logo_b64 = get_logo_base64()
+    if logo_b64:
+        img_tag = f'<img src="data:image/jpeg;base64,{logo_b64}" />'
+    else:
+        img_tag = '<div style="width:64px;height:64px;background:#1e3050;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:28px;">🏗️</div>'
+
+    st.markdown(f"""
+    <div class="logo-header">
+        {img_tag}
+        <div class="logo-text-block">
+            <div class="logo-title">ARTHAV INFRA LLP</div>
+            <div class="logo-sub">Expense &amp; Invoice Tracker</div>
+        </div>
     </div>
-    <div class="page-subtitle">Expense & Invoice Tracker</div>
-    <hr style="margin: 14px 0 24px;">
     """, unsafe_allow_html=True)
 
 
@@ -664,6 +699,15 @@ def render_summary_cards(df: pd.DataFrame):
 
 
 def render_sidebar_add_expense(engine):
+    # Sidebar logo
+    logo_b64 = get_logo_base64()
+    if logo_b64:
+        st.sidebar.markdown(f"""
+        <div style="text-align:center; padding: 10px 0 16px;">
+            <img src="data:image/jpeg;base64,{logo_b64}"
+                 style="width:80px;height:80px;border-radius:12px;object-fit:cover;" />
+        </div>
+        """, unsafe_allow_html=True)
     st.sidebar.markdown("## ➕ Add Expense")
     vendors    = get_vendors(engine)
     categories = get_categories(engine)
