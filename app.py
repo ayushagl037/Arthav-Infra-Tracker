@@ -435,7 +435,7 @@ def get_drive_service():
 
         creds = service_account.Credentials.from_service_account_info(
             creds_dict,
-            scopes=["https://www.googleapis.com/auth/drive.file"],
+            scopes=["https://www.googleapis.com/auth/drive"],
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as e:
@@ -479,7 +479,7 @@ def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> str | None:
 
         return uploaded.get("webViewLink")
     except Exception as e:
-        st.warning(f"Google Drive upload failed: {e}")
+        st.warning(f"Google Drive upload failed: {type(e).__name__}: {e}")
         return None
 
 
