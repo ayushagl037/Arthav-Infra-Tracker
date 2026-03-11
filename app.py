@@ -1044,6 +1044,32 @@ def render_sidebar_export(df: pd.DataFrame):
                            file_name="arthav_expenses.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    # ── Full backup ZIP ───────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## 🗄️ Full Backup")
+    st.sidebar.caption("Downloads your entire database + all PDFs as a ZIP file.")
+    if st.sidebar.button("⬇ Download Full Backup ZIP", use_container_width=True):
+        zip_buf = io.BytesIO()
+        with __import__("zipfile").ZipFile(zip_buf, "w", __import__("zipfile").ZIP_DEFLATED) as zf:
+            # Add database
+            if Path(DB_PATH).exists():
+                zf.write(DB_PATH, "arthav_expenses.db")
+            # Add all PDFs from invoices folder
+            if INVOICE_DIR.exists():
+                for pdf_file in INVOICE_DIR.glob("*.pdf"):
+                    zf.write(pdf_file, f"invoices/{pdf_file.name}")
+            # Add CSV export
+            zf.writestr("arthav_expenses.csv", df.to_csv(index=False))
+        zip_buf.seek(0)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.sidebar.download_button(
+            label="📦 Click to Save ZIP",
+            data=zip_buf.getvalue(),
+            file_name=f"arthav_full_backup_{timestamp}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
 
 def render_accounting_table(df: pd.DataFrame, engine):
     st.markdown('<div class="section-header">Ledger</div>', unsafe_allow_html=True)
