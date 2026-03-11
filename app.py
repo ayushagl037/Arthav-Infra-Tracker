@@ -90,6 +90,12 @@ class Project(Base):
     name     = Column(Text, nullable=False, unique=True)
     expenses = relationship("Expense", back_populates="project")
 
+class ReceiptCounter(Base):
+    """Tracks the last used receipt number for auto-increment."""
+    __tablename__ = "receipt_counter"
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    last_number   = Column(Integer, default=0, nullable=False)
+
 class GstTransaction(Base):
     """Tracks output GST collected on sales/services rendered."""
     __tablename__ = "gst_transactions"
@@ -130,7 +136,15 @@ def get_engine():
     Base.metadata.create_all(engine)
     _seed_categories(engine)
     _seed_projects(engine)
+    _seed_receipt_counter(engine)
     return engine
+
+
+def _seed_receipt_counter(engine):
+    with Session(engine) as s:
+        if not s.query(ReceiptCounter).first():
+            s.add(ReceiptCounter(last_number=0))
+            s.commit()
 
 
 def _seed_categories(engine):
@@ -307,6 +321,63 @@ def delete_gst_transaction(engine, txn_id: int):
 
 
 # ─────────────────────────────────────────────
+# 3c. RECEIPT HELPERS
+# ─────────────────────────────────────────────
+
+def next_receipt_number(engine) -> str:
+    """Generate next sequential receipt number e.g. AIRC-2026-0047"""
+    with Session(engine) as s:
+        counter = s.query(ReceiptCounter).first()
+        counter.last_number += 1
+        num = counter.last_number
+        s.commit()
+    year = datetime.now().year
+    return f"AIRC-{year}-{num:04d}"
+
+
+def amount_in_words(amount: float) -> str:
+    """Convert a float rupee amount to Indian English words."""
+    ones = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+            "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen",
+            "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+    tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty",
+            "Sixty", "Seventy", "Eighty", "Ninety"]
+
+    def _two_digits(n):
+        if n < 20:
+            return ones[n]
+        return tens[n // 10] + (" " + ones[n % 10] if n % 10 else "")
+
+    def _three_digits(n):
+        if n >= 100:
+            return ones[n // 100] + " Hundred" + (" " + _two_digits(n % 100) if n % 100 else "")
+        return _two_digits(n)
+
+    rupees = int(amount)
+    paise  = round((amount - rupees) * 100)
+
+    if rupees == 0:
+        words = "Zero"
+    else:
+        parts = []
+        cr  = rupees // 10000000; rupees %= 10000000
+        lac = rupees // 100000;   rupees %= 100000
+        th  = rupees // 1000;     rupees %= 1000
+        hun = rupees
+
+        if cr:  parts.append(_three_digits(cr)  + " Crore")
+        if lac: parts.append(_three_digits(lac) + " Lakh")
+        if th:  parts.append(_three_digits(th)  + " Thousand")
+        if hun: parts.append(_three_digits(hun))
+        words = " ".join(parts)
+
+    result = f"Rupees {words}"
+    if paise:
+        result += f" and {_two_digits(paise)} Paise"
+    return result + " Only"
+
+
+# ─────────────────────────────────────────────
 # 4. FILE HELPERS
 # ─────────────────────────────────────────────
 
@@ -338,6 +409,202 @@ def save_invoice_bytes(pdf_bytes: bytes, original_name: str) -> Path:
     with open(dest, "wb") as f:
         f.write(pdf_bytes)
     return dest
+
+
+# ─────────────────────────────────────────────
+# 4c. RECEIPT PDF GENERATOR
+# ─────────────────────────────────────────────
+
+def generate_receipt_pdf(
+    receipt_no: str,
+    receipt_date: date,
+    payee_name: str,
+    payee_contact: str,
+    project: str,
+    purpose: str,
+    amount: float,
+    payment_mode: str,
+    category: str,
+    notes: str,
+    logo_path: str = "Arthav_Logo_File.jpg",
+) -> bytes:
+    """Generate a branded Arthav Infra LLP receipt PDF and return bytes."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, HRFlowable, Image)
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+
+    # ── Colours matching brand ──────────────────────────────────
+    NAVY   = colors.HexColor("#0d1b3e")
+    GOLD   = colors.HexColor("#c9a84c")
+    LGOLD  = colors.HexColor("#e2c07a")
+    WHITE  = colors.white
+    LGREY  = colors.HexColor("#f5f5f0")
+    MGREY  = colors.HexColor("#cccccc")
+    DGREY  = colors.HexColor("#444444")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18*mm, rightMargin=18*mm,
+        topMargin=14*mm, bottomMargin=14*mm,
+    )
+
+    W = A4[0] - 36*mm   # usable width
+
+    def style(size=10, bold=False, color=DGREY, align=TA_LEFT, leading=None):
+        return ParagraphStyle(
+            "s", fontSize=size, fontName="Helvetica-Bold" if bold else "Helvetica",
+            textColor=color, alignment=align,
+            leading=leading or size * 1.35,
+        )
+
+    story = []
+
+    # ── Header bar ───────────────────────────────────────────────
+    logo_img = None
+    if Path(logo_path).exists():
+        try:
+            logo_img = Image(logo_path, width=18*mm, height=18*mm)
+            logo_img.hAlign = "LEFT"
+        except Exception:
+            logo_img = None
+
+    header_data = [[
+        logo_img or Paragraph("", style()),
+        Paragraph("ARTHAV INFRA LLP<br/>"
+                  "<font size='8' color='#c9a84c'>Real Estate &amp; Construction</font>",
+                  style(14, bold=True, color=WHITE, align=TA_LEFT)),
+        Paragraph("PAYMENT RECEIPT",
+                  style(18, bold=True, color=GOLD, align=TA_RIGHT)),
+    ]]
+    header_table = Table(header_data, colWidths=[22*mm, W*0.48, W*0.42])
+    header_table.setStyle(TableStyle([
+        ("BACKGROUND",  (0, 0), (-1, -1), NAVY),
+        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",(0, 0), (-1, -1), 8),
+        ("TOPPADDING",  (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING",(0,0), (-1, -1), 10),
+        ("ROUNDEDCORNERS", (0, 0), (-1, -1), [6, 6, 0, 0]),
+    ]))
+    story.append(header_table)
+
+    # ── Gold accent stripe ────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=3, color=GOLD, spaceAfter=6))
+
+    # ── Receipt meta row ─────────────────────────────────────────
+    meta_data = [[
+        Paragraph(f"<b>Receipt No:</b> {receipt_no}", style(10, color=NAVY)),
+        Paragraph(f"<b>Date:</b> {receipt_date.strftime('%d %B %Y')}",
+                  style(10, color=NAVY, align=TA_RIGHT)),
+    ]]
+    meta_table = Table(meta_data, colWidths=[W * 0.5, W * 0.5])
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), LGREY),
+        ("TOPPADDING",   (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 8),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Amount box ───────────────────────────────────────────────
+    amt_data = [[
+        Paragraph("AMOUNT PAID", style(9, color=GOLD, align=TA_CENTER)),
+        Paragraph(f"₹ {amount:,.2f}", style(26, bold=True, color=WHITE, align=TA_CENTER)),
+        Paragraph(amount_in_words(amount), style(9, color=LGOLD, align=TA_CENTER)),
+    ]]
+    amt_table = Table(amt_data, colWidths=[W])
+    amt_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), NAVY),
+        ("TOPPADDING",   (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 10),
+        ("ALIGN",        (0, 0), (-1, -1), "CENTER"),
+        ("SPAN",         (0, 0), (-1, -1)),
+    ]))
+    # Use 3-row version instead
+    amt_data2 = [
+        [Paragraph("AMOUNT PAID", style(9, bold=True, color=GOLD, align=TA_CENTER))],
+        [Paragraph(f"₹ {amount:,.2f}", style(28, bold=True, color=WHITE, align=TA_CENTER))],
+        [Paragraph(amount_in_words(amount), style(9, color=LGOLD, align=TA_CENTER))],
+    ]
+    amt_table2 = Table(amt_data2, colWidths=[W])
+    amt_table2.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), NAVY),
+        ("TOPPADDING",    (0, 0), (0, 0),   8),
+        ("BOTTOMPADDING", (0, 2), (0, 2),   10),
+        ("TOPPADDING",    (0, 1), (0, 2),   2),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("ROUNDEDCORNERS",(0, 0), (-1, -1), [4, 4, 4, 4]),
+    ]))
+    story.append(amt_table2)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Details table ─────────────────────────────────────────────
+    def row(label, value):
+        return [
+            Paragraph(label, style(9, bold=True, color=NAVY)),
+            Paragraph(str(value) if value else "—", style(9, color=DGREY)),
+        ]
+
+    details = [
+        row("Received From",   payee_name),
+        row("Contact",         payee_contact or "—"),
+        row("Project",         project),
+        row("Purpose",         purpose),
+        row("Category",        category),
+        row("Payment Mode",    payment_mode),
+        row("Notes",           notes or "—"),
+    ]
+    det_table = Table(details, colWidths=[W * 0.28, W * 0.72])
+    det_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (0, -1), LGREY),
+        ("BACKGROUND",    (1, 0), (1, -1), WHITE),
+        ("ROWBACKGROUNDS",(1, 0), (1, -1), [WHITE, colors.HexColor("#fafaf7")]),
+        ("TOPPADDING",    (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+        ("LINEBELOW",     (0, 0), (-1, -2), 0.5, MGREY),
+        ("BOX",           (0, 0), (-1, -1), 1,   MGREY),
+    ]))
+    story.append(det_table)
+    story.append(Spacer(1, 10*mm))
+
+    # ── Signature row ─────────────────────────────────────────────
+    sig_data = [[
+        Paragraph("Received By (Signature)\n\n\n___________________________\n"
+                  "<font size='8' color='#888888'>Payee Signature &amp; Date</font>",
+                  style(9, color=DGREY)),
+        Paragraph("For Arthav Infra LLP\n\n\n___________________________\n"
+                  "<font size='8' color='#888888'>Authorised Signatory</font>",
+                  style(9, color=DGREY, align=TA_RIGHT)),
+    ]]
+    sig_table = Table(sig_data, colWidths=[W * 0.5, W * 0.5])
+    sig_table.setStyle(TableStyle([
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(sig_table)
+
+    # ── Footer ────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=1, color=GOLD, spaceBefore=4))
+    story.append(Paragraph(
+        "Arthav Infra LLP · Hyderabad, Telangana · This is a computer-generated receipt",
+        style(7, color=MGREY, align=TA_CENTER)
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -1373,6 +1640,148 @@ def render_invoice_scanner_tab(engine):
         st.rerun()
 
 
+def render_receipt_generator_tab(engine):
+    st.markdown('<div class="section-header">Receipt Generator</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="background:#0f2040; border:1px solid #1e3050; border-radius:10px;
+                padding:14px 20px; margin-bottom:20px; border-left:3px solid #c9a84c;">
+        <strong style="color:#c9a84c;">For cash payments without an invoice</strong>
+        <span style="color:#c9c6be; font-size:14px;"> — daily labour, petty materials, site expenses, etc.
+        Fill in the details below to generate a branded PDF receipt that gets saved to your records automatically.</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    projects   = get_projects(engine)
+    categories = get_categories(engine)
+    project_names  = [p.name for p in projects]
+    category_names = [c.name for c in categories]
+    project_map    = {p.name: p.id for p in projects}
+    category_map   = {c.name: c.id for c in categories}
+
+    with st.form("receipt_form", clear_on_submit=False):
+        st.markdown("#### 👤 Payee Details")
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            payee_name    = st.text_input("Payee Name *", placeholder="e.g. Raju (Mason), Sri Sai Traders")
+            payee_contact = st.text_input("Contact / Mobile", placeholder="Optional")
+        with r1c2:
+            receipt_date  = st.date_input("Date", value=date.today())
+            payment_mode  = st.selectbox("Payment Mode",
+                                          ["Cash", "UPI", "Bank Transfer", "Cheque", "Other"])
+
+        st.markdown("#### 🏗️ Expense Details")
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            project  = st.selectbox("Project *", project_names)
+            category = st.selectbox("Category *", category_names,
+                                     index=category_names.index("Labour")
+                                     if "Labour" in category_names else 0)
+        with r2c2:
+            amount  = st.number_input("Amount Paid (₹) *", min_value=0.0, step=100.0)
+            purpose = st.text_input("Purpose / Description *",
+                                     placeholder="e.g. Daily labour charges, Sand supply, etc.")
+
+        notes = st.text_area("Additional Notes", placeholder="Optional — any extra details",
+                              height=80)
+
+        st.markdown("#### 💾 Save Options")
+        save_to_db = st.checkbox("Also log this as an expense in the database", value=True)
+
+        submitted = st.form_submit_button("🖨️ Generate Receipt PDF", use_container_width=True)
+
+    if submitted:
+        # Validation
+        errors = []
+        if not payee_name.strip():
+            errors.append("Payee name is required.")
+        if not purpose.strip():
+            errors.append("Purpose / description is required.")
+        if amount <= 0:
+            errors.append("Amount must be greater than 0.")
+        if errors:
+            for e in errors:
+                st.error(e)
+            return
+
+        with st.spinner("Generating receipt..."):
+            receipt_no  = next_receipt_number(engine)
+            pdf_bytes   = generate_receipt_pdf(
+                receipt_no   = receipt_no,
+                receipt_date = receipt_date,
+                payee_name   = payee_name.strip(),
+                payee_contact= payee_contact.strip(),
+                project      = project,
+                purpose      = purpose.strip(),
+                amount       = amount,
+                payment_mode = payment_mode,
+                category     = category,
+                notes        = notes.strip(),
+            )
+
+        # Save to /invoices/ folder
+        filename  = f"{receipt_no}_{payee_name.strip().replace(' ','_')}.pdf"
+        inv_path  = save_invoice_bytes(pdf_bytes, filename)
+
+        # Optionally log to expenses DB
+        if save_to_db:
+            vendors    = get_vendors(engine)
+            vendor_map = {v.name: v.id for v in vendors}
+            # Auto-create vendor if not exists
+            if payee_name.strip() not in vendor_map:
+                add_vendor(engine, payee_name.strip(), "", payee_contact.strip())
+                vendors    = get_vendors(engine)
+                vendor_map = {v.name: v.id for v in vendors}
+            vendor_id   = vendor_map.get(payee_name.strip())
+            category_id = category_map.get(category)
+            project_id  = project_map.get(project)
+            add_expense(engine, receipt_date, vendor_id, category_id, project_id,
+                        purpose.strip(), amount, 0.0, "Paid", inv_path)
+
+        # ── Preview + Download ────────────────────────────────────
+        st.success(f"✅ Receipt **{receipt_no}** generated successfully!")
+
+        col_dl, col_info = st.columns([1, 2])
+        with col_dl:
+            st.download_button(
+                label="⬇️ Download Receipt PDF",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        with col_info:
+            st.markdown(f"""
+            <div style="background:#0f2040; border:1px solid #1e3050; border-radius:8px; padding:12px 16px;">
+                <div style="color:#c9a84c; font-weight:700; font-size:13px;">{receipt_no}</div>
+                <div style="color:#e8e6df; font-size:15px; margin:4px 0;">₹{amount:,.2f} — {payee_name}</div>
+                <div style="color:#7a8aaa; font-size:12px;">{project} · {category} · {payment_mode}</div>
+                {'<div style="color:#00c07f; font-size:11px; margin-top:4px;">✓ Logged to expense database</div>' if save_to_db else ''}
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Recent receipts table ─────────────────────────────────
+        st.markdown('<div class="section-header">Recent Receipts</div>', unsafe_allow_html=True)
+        df = get_expenses_df(engine)
+        if not df.empty:
+            receipts_df = df[df["invoice_path"].str.contains("AIRC-", na=False)].copy()
+            if not receipts_df.empty:
+                st.dataframe(
+                    receipts_df[["date", "project", "vendor", "category",
+                                 "description", "gross_amount", "invoice_path"]]
+                    .rename(columns={
+                        "date": "Date", "project": "Project", "vendor": "Payee",
+                        "category": "Category", "description": "Purpose",
+                        "gross_amount": "Amount (₹)", "invoice_path": "Receipt File"
+                    }),
+                    use_container_width=True, height=280, hide_index=True,
+                )
+            else:
+                st.info("No receipts generated yet.")
+
+
 def render_projects_tab(engine, df: pd.DataFrame):
     st.markdown('<div class="section-header">Project Summary</div>', unsafe_allow_html=True)
     projects = get_projects(engine)
@@ -1419,13 +1828,16 @@ def main():
     render_header()
     render_summary_cards(df)
 
-    tab_ledger, tab_scanner, tab_analytics, tab_gst, tab_vendors, tab_projects = st.tabs([
-        "📒  Ledger", "🤖  AI Scanner", "📊  Analytics", "🧾  Tax Dashboard", "🏢  Vendors", "🏗️  Projects"
+    tab_ledger, tab_scanner, tab_receipt, tab_analytics, tab_gst, tab_vendors, tab_projects = st.tabs([
+        "📒  Ledger", "🤖  AI Scanner", "🖨️  Receipt Generator",
+        "📊  Analytics", "🧾  Tax Dashboard", "🏢  Vendors", "🏗️  Projects"
     ])
     with tab_ledger:
         render_accounting_table(df, engine)
     with tab_scanner:
         render_invoice_scanner_tab(engine)
+    with tab_receipt:
+        render_receipt_generator_tab(engine)
     with tab_analytics:
         render_analytics_tab(df)
     with tab_gst:
