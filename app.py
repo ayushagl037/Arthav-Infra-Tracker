@@ -36,9 +36,10 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 # 1. CONSTANTS & DIRECTORIES
 # ─────────────────────────────────────────────
-DB_PATH     = "arthav_expenses.db"
-INVOICE_DIR = Path("invoices")
+DB_PATH        = "arthav_expenses.db"
+INVOICE_DIR    = Path("invoices")
 INVOICE_DIR.mkdir(exist_ok=True)
+GDRIVE_FOLDER  = "1PitNGfasNhTHGQqIyseHzTjhbnaJhUhg"
 
 DEFAULT_CATEGORIES = ["Operational", "Utilities", "Raw Materials", "Marketing",
                       "Labour", "Legal & Professional", "Travel", "Miscellaneous",
@@ -408,6 +409,83 @@ def save_invoice_bytes(pdf_bytes: bytes, original_name: str, expense_date: date 
     with open(dest, "wb") as f:
         f.write(pdf_bytes)
     return dest
+
+
+# ─────────────────────────────────────────────
+# 4d. GOOGLE DRIVE INTEGRATION
+# ─────────────────────────────────────────────
+
+@st.cache_resource
+def get_drive_service():
+    """
+    Build and cache a Google Drive API service using credentials
+    stored in Streamlit secrets. Returns None if not configured.
+    """
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        if "gdrive" not in st.secrets:
+            return None
+
+        creds_dict = dict(st.secrets["gdrive"])
+        # Streamlit secrets stores multiline strings with literal \n — fix private key
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        return None
+
+
+def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> str | None:
+    """
+    Upload a PDF to the Arthav Infra Google Drive folder.
+    Uses file_path for the filename. Reads bytes from disk if pdf_bytes not provided.
+    Returns the Drive file URL or None on failure.
+    """
+    service = get_drive_service()
+    if service is None:
+        return None
+
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+
+        filename = file_path.name
+        if pdf_bytes is None:
+            if not file_path.exists():
+                return None
+            with open(file_path, "rb") as f:
+                pdf_bytes = f.read()
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            resumable=False,
+        )
+        file_metadata = {
+            "name":    filename,
+            "parents": [GDRIVE_FOLDER],
+        }
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute()
+
+        return uploaded.get("webViewLink")
+    except Exception as e:
+        st.warning(f"Google Drive upload failed: {e}")
+        return None
+
+
+def gdrive_configured() -> bool:
+    """Check if Google Drive credentials are available."""
+    return "gdrive" in st.secrets
 
 
 # ─────────────────────────────────────────────
@@ -1003,6 +1081,8 @@ def render_sidebar_add_expense(engine):
                 category_id = category_map.get(category)
                 project_id  = project_map.get(project_name)
                 inv_path    = save_invoice(pdf_file, exp_date)
+                if inv_path:
+                    upload_to_drive(inv_path)
                 add_expense(engine, exp_date, vendor_id, category_id, project_id,
                             description, gross, gst, status, inv_path)
                 st.success("✅ Expense saved!")
@@ -1650,6 +1730,7 @@ def render_invoice_scanner_tab(engine):
             st.session_state["ai_pdf_name"],
             exp_date,
         )
+        upload_to_drive(inv_path, st.session_state["ai_pdf_bytes"])
 
         add_expense(
             engine, exp_date,
@@ -1748,6 +1829,7 @@ def render_receipt_generator_tab(engine):
         # Save to /invoices/ folder
         filename  = f"{receipt_no}_{payee_name.strip().replace(' ','_')}.pdf"
         inv_path  = save_invoice_bytes(pdf_bytes, filename, receipt_date)
+        drive_url = upload_to_drive(inv_path, pdf_bytes)
 
         # Optionally log to expenses DB
         if save_to_db:
@@ -1766,6 +1848,8 @@ def render_receipt_generator_tab(engine):
 
         # ── Preview + Download ────────────────────────────────────
         st.success(f"✅ Receipt **{receipt_no}** generated successfully!")
+        if drive_url:
+            st.success(f"☁️ Saved to Google Drive — [View in Drive]({drive_url})")
 
         col_dl, col_info = st.columns([1, 2])
         with col_dl:
