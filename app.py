@@ -126,6 +126,7 @@ class Expense(Base):
         CheckConstraint("payment_status IN ('Pending','Paid')"),
     )
     invoice_path   = Column(Text)
+    drive_file_id  = Column(Text)   # Google Drive file ID for overwrite support
     vendor         = relationship("Vendor",   back_populates="expenses")
     category       = relationship("Category", back_populates="expenses")
     project        = relationship("Project",  back_populates="expenses")
@@ -135,6 +136,7 @@ class Expense(Base):
 def get_engine():
     engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
     Base.metadata.create_all(engine)
+    _migrate_add_drive_file_id(engine)
     _seed_categories(engine)
     _seed_projects(engine)
     _seed_receipt_counter(engine)
@@ -193,7 +195,7 @@ def add_vendor(engine, name, gst, contact):
 
 
 def add_expense(engine, exp_date, vendor_id, category_id, project_id, description,
-                gross, gst, status, invoice_path):
+                gross, gst, status, invoice_path, drive_file_id=None):
     with Session(engine) as s:
         e = Expense(
             date=exp_date,
@@ -205,9 +207,50 @@ def add_expense(engine, exp_date, vendor_id, category_id, project_id, descriptio
             gst_amount=gst,
             payment_status=status,
             invoice_path=str(invoice_path) if invoice_path else None,
+            drive_file_id=drive_file_id,
         )
         s.add(e)
         s.commit()
+
+
+def update_expense_drive_id(engine, expense_id: int, drive_file_id: str):
+    """Store Drive file ID against an expense record."""
+    with Session(engine) as s:
+        exp = s.get(Expense, expense_id)
+        if exp:
+            exp.drive_file_id = drive_file_id
+            s.commit()
+
+
+def get_receipt_expense(engine, receipt_no: str):
+    """Fetch the expense row for a given receipt number (matched via invoice_path)."""
+    with Session(engine) as s:
+        exps = s.query(Expense).all()
+        for e in exps:
+            if e.invoice_path and receipt_no in e.invoice_path:
+                # Return a plain dict so it survives outside the session
+                return {
+                    "id":            e.id,
+                    "date":          e.date,
+                    "description":   e.description,
+                    "gross_amount":  e.gross_amount,
+                    "invoice_path":  e.invoice_path,
+                    "drive_file_id": e.drive_file_id,
+                    "vendor_id":     e.vendor_id,
+                    "category_id":   e.category_id,
+                    "project_id":    e.project_id,
+                    "payment_status":e.payment_status,
+                }
+    return None
+
+
+def _migrate_add_drive_file_id(engine):
+    """Safely add drive_file_id column if it doesn't exist (for existing DBs)."""
+    with engine.connect() as conn:
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(expenses)")).fetchall()]
+        if "drive_file_id" not in cols:
+            conn.execute(text("ALTER TABLE expenses ADD COLUMN drive_file_id TEXT"))
+            conn.commit()
 
 
 def get_expenses_df(engine) -> pd.DataFrame:
@@ -442,15 +485,14 @@ def get_drive_service():
         return None
 
 
-def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> str | None:
+def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> tuple[str | None, str | None]:
     """
     Upload a PDF to the Arthav Infra Google Drive folder.
-    Uses file_path for the filename. Reads bytes from disk if pdf_bytes not provided.
-    Returns the Drive file URL or None on failure.
+    Returns (drive_file_id, webViewLink) or (None, None) on failure.
     """
     service = get_drive_service()
     if service is None:
-        return None
+        return None, None
 
     try:
         from googleapiclient.http import MediaIoBaseUpload
@@ -458,7 +500,7 @@ def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> str | None:
         filename = file_path.name
         if pdf_bytes is None:
             if not file_path.exists():
-                return None
+                return None, None
             with open(file_path, "rb") as f:
                 pdf_bytes = f.read()
 
@@ -477,10 +519,39 @@ def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> str | None:
             fields="id, webViewLink",
         ).execute()
 
-        return uploaded.get("webViewLink")
+        return uploaded.get("id"), uploaded.get("webViewLink")
     except Exception as e:
         st.warning(f"Google Drive upload failed: {type(e).__name__}: {e}")
-        return None
+        return None, None
+
+
+def overwrite_on_drive(file_id: str, new_filename: str, pdf_bytes: bytes) -> tuple[str | None, str | None]:
+    """
+    Overwrite an existing Drive file with new PDF content.
+    Returns (file_id, webViewLink) or (None, None) on failure.
+    """
+    service = get_drive_service()
+    if service is None:
+        return None, None
+
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            resumable=False,
+        )
+        updated = service.files().update(
+            fileId=file_id,
+            body={"name": new_filename},
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute()
+        return updated.get("id"), updated.get("webViewLink")
+    except Exception as e:
+        st.warning(f"Google Drive overwrite failed: {type(e).__name__}: {e}")
+        return None, None
 
 
 def gdrive_configured() -> bool:
@@ -1081,10 +1152,9 @@ def render_sidebar_add_expense(engine):
                 category_id = category_map.get(category)
                 project_id  = project_map.get(project_name)
                 inv_path    = save_invoice(pdf_file, exp_date)
-                if inv_path:
-                    upload_to_drive(inv_path)
+                drive_fid, _ = upload_to_drive(inv_path) if inv_path else (None, None)
                 add_expense(engine, exp_date, vendor_id, category_id, project_id,
-                            description, gross, gst, status, inv_path)
+                            description, gross, gst, status, inv_path, drive_fid)
                 st.success("✅ Expense saved!")
                 st.rerun()
 
@@ -1730,12 +1800,12 @@ def render_invoice_scanner_tab(engine):
             st.session_state["ai_pdf_name"],
             exp_date,
         )
-        upload_to_drive(inv_path, st.session_state["ai_pdf_bytes"])
+        drive_fid, _ = upload_to_drive(inv_path, st.session_state["ai_pdf_bytes"])
 
         add_expense(
             engine, exp_date,
             final_vendor_id, final_category_id, final_project_id,
-            desc, gross, gst, chosen_status, inv_path
+            desc, gross, gst, chosen_status, inv_path, drive_fid
         )
 
         # Clear session state
@@ -1829,13 +1899,12 @@ def render_receipt_generator_tab(engine):
         # Save to /invoices/ folder
         filename  = f"{receipt_no}_{payee_name.strip().replace(' ','_')}.pdf"
         inv_path  = save_invoice_bytes(pdf_bytes, filename, receipt_date)
-        drive_url = upload_to_drive(inv_path, pdf_bytes)
+        drive_fid, drive_url = upload_to_drive(inv_path, pdf_bytes)
 
-        # Optionally log to expenses DB
+        # Log to expenses DB
         if save_to_db:
             vendors    = get_vendors(engine)
             vendor_map = {v.name: v.id for v in vendors}
-            # Auto-create vendor if not exists
             if payee_name.strip() not in vendor_map:
                 add_vendor(engine, payee_name.strip(), "", payee_contact.strip())
                 vendors    = get_vendors(engine)
@@ -1844,9 +1913,8 @@ def render_receipt_generator_tab(engine):
             category_id = category_map.get(category)
             project_id  = project_map.get(project)
             add_expense(engine, receipt_date, vendor_id, category_id, project_id,
-                        purpose.strip(), amount, 0.0, "Paid", inv_path)
+                        purpose.strip(), amount, 0.0, "Paid", inv_path, drive_fid)
 
-        # ── Preview + Download ────────────────────────────────────
         st.success(f"✅ Receipt **{receipt_no}** generated successfully!")
         if drive_url:
             st.success(f"☁️ Saved to Google Drive — [View in Drive]({drive_url})")
@@ -1890,6 +1958,129 @@ def render_receipt_generator_tab(engine):
                 )
             else:
                 st.info("No receipts generated yet.")
+
+    # ── Edit Existing Receipt ─────────────────────────────────────
+    st.markdown('<div class="section-header">Edit an Existing Receipt</div>',
+                unsafe_allow_html=True)
+    st.caption("Load a past receipt by its number, edit the details, and the PDF will be regenerated and overwritten on Google Drive.")
+
+    edit_col1, edit_col2 = st.columns([2, 1])
+    with edit_col1:
+        search_no = st.text_input("Enter Receipt Number to Edit",
+                                   placeholder="e.g. AIRC-2026-0001",
+                                   key="edit_receipt_search")
+    with edit_col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        load_clicked = st.button("🔍 Load Receipt", key="load_receipt_btn")
+
+    if load_clicked and search_no.strip():
+        rec = get_receipt_expense(engine, search_no.strip().upper())
+        if rec:
+            st.session_state["editing_receipt"]    = rec
+            st.session_state["editing_receipt_no"] = search_no.strip().upper()
+            st.success(f"✅ Receipt {search_no.strip().upper()} loaded — edit below.")
+        else:
+            st.error(f"No receipt found matching '{search_no.strip()}'.")
+
+    if "editing_receipt" in st.session_state:
+        rec    = st.session_state["editing_receipt"]
+        rec_no = st.session_state["editing_receipt_no"]
+
+        vendors        = get_vendors(engine)
+        categories     = get_categories(engine)
+        projects       = get_projects(engine)
+        vendor_names   = [v.name for v in vendors]
+        category_names = [c.name for c in categories]
+        project_names  = [p.name for p in projects]
+        vendor_map     = {v.name: v.id for v in vendors}
+        category_map   = {c.name: c.id for c in categories}
+        project_map    = {p.name: p.id for p in projects}
+        id_vendor_map  = {v.id: v.name for v in vendors}
+        id_cat_map     = {c.id: c.name for c in categories}
+        id_proj_map    = {p.id: p.name for p in projects}
+
+        def safe_idx(lst, val, fallback=0):
+            return lst.index(val) if val in lst else fallback
+
+        st.markdown(f"**Editing: `{rec_no}`**")
+        with st.form("edit_receipt_form", clear_on_submit=False):
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                e_payee   = st.text_input("Payee Name",
+                                           value=id_vendor_map.get(rec["vendor_id"], ""),
+                                           key="e_payee")
+                e_contact = st.text_input("Contact", key="e_contact")
+                e_date    = st.date_input("Date", value=rec["date"], key="e_date")
+                e_mode    = st.selectbox("Payment Mode",
+                                          ["Cash","UPI","Bank Transfer","Cheque","Other"],
+                                          key="e_mode")
+            with ec2:
+                e_proj    = st.selectbox("Project", project_names,
+                                          index=safe_idx(project_names,
+                                                         id_proj_map.get(rec["project_id"], "Other")),
+                                          key="e_proj")
+                e_cat     = st.selectbox("Category", category_names,
+                                          index=safe_idx(category_names,
+                                                         id_cat_map.get(rec["category_id"], "Labour")),
+                                          key="e_cat")
+                e_amount  = st.number_input("Amount (₹)", value=float(rec["gross_amount"]),
+                                             min_value=0.0, step=100.0, key="e_amount")
+                e_purpose = st.text_input("Purpose", value=rec["description"] or "",
+                                           key="e_purpose")
+            e_notes    = st.text_area("Notes", key="e_notes", height=60)
+            update_btn = st.form_submit_button("💾 Save & Overwrite on Drive",
+                                                use_container_width=True)
+
+        if update_btn:
+            if not e_payee.strip() or e_amount <= 0:
+                st.error("Payee and amount are required.")
+            else:
+                with st.spinner("Regenerating receipt and updating Drive..."):
+                    new_pdf = generate_receipt_pdf(
+                        receipt_no    = rec_no,
+                        receipt_date  = e_date,
+                        payee_name    = e_payee.strip(),
+                        payee_contact = e_contact.strip(),
+                        project       = e_proj,
+                        purpose       = e_purpose.strip(),
+                        amount        = e_amount,
+                        payment_mode  = e_mode,
+                        category      = e_cat,
+                        notes         = e_notes.strip(),
+                    )
+                    new_filename = f"{e_date.strftime('%Y%m%d')}_{rec_no}_{e_payee.strip().replace(' ','_')}.pdf"
+                    new_path     = save_invoice_bytes(new_pdf, new_filename, e_date)
+
+                    existing_fid = rec.get("drive_file_id")
+                    if existing_fid:
+                        new_fid, drive_url = overwrite_on_drive(existing_fid, new_filename, new_pdf)
+                    else:
+                        new_fid, drive_url = upload_to_drive(new_path, new_pdf)
+
+                    with Session(engine) as s:
+                        exp = s.get(Expense, rec["id"])
+                        if exp:
+                            exp.date          = e_date
+                            exp.description   = e_purpose.strip()
+                            exp.gross_amount  = e_amount
+                            exp.invoice_path  = str(new_path)
+                            exp.drive_file_id = new_fid or existing_fid
+                            exp.vendor_id     = vendor_map.get(e_payee.strip(), exp.vendor_id)
+                            exp.category_id   = category_map.get(e_cat, exp.category_id)
+                            exp.project_id    = project_map.get(e_proj, exp.project_id)
+                            s.commit()
+
+                st.success(f"✅ Receipt `{rec_no}` updated successfully!")
+                if drive_url:
+                    st.success(f"☁️ Google Drive file overwritten — [View in Drive]({drive_url})")
+                st.download_button(
+                    "⬇️ Download Updated Receipt",
+                    data=new_pdf,
+                    file_name=new_filename,
+                    mime="application/pdf",
+                )
+                st.session_state.pop("editing_receipt", None)
+                st.session_state.pop("editing_receipt_no", None)
 
 
 def render_projects_tab(engine, df: pd.DataFrame):
