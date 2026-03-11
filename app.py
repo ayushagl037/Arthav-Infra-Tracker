@@ -381,7 +381,7 @@ def amount_in_words(amount: float) -> str:
 # 4. FILE HELPERS
 # ─────────────────────────────────────────────
 
-def save_invoice(uploaded_file) -> Path | None:
+def save_invoice(uploaded_file, expense_date: date = None) -> Path | None:
     """Validate it's a PDF, save to /invoices, return path."""
     if uploaded_file is None:
         return None
@@ -389,23 +389,22 @@ def save_invoice(uploaded_file) -> Path | None:
         st.sidebar.error("⚠️ Only PDF files are accepted.")
         return None
     if uploaded_file.type not in ("application/pdf",):
-        # extra MIME check
         if not uploaded_file.name.lower().endswith(".pdf"):
             st.sidebar.error("⚠️ Invalid file type. Please upload a PDF.")
             return None
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name  = uploaded_file.name.replace(" ", "_")
-    dest       = INVOICE_DIR / f"{timestamp}_{safe_name}"
+    date_prefix = expense_date.strftime("%Y%m%d") if expense_date else datetime.now().strftime("%Y%m%d")
+    safe_name   = uploaded_file.name.replace(" ", "_")
+    dest        = INVOICE_DIR / f"{date_prefix}_{safe_name}"
     with open(dest, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return dest
 
 
-def save_invoice_bytes(pdf_bytes: bytes, original_name: str) -> Path:
-    """Save raw PDF bytes (from AI extraction flow) to /invoices/."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = original_name.replace(" ", "_")
-    dest      = INVOICE_DIR / f"{timestamp}_{safe_name}"
+def save_invoice_bytes(pdf_bytes: bytes, original_name: str, expense_date: date = None) -> Path:
+    """Save raw PDF bytes to /invoices/ using the invoice date as filename prefix."""
+    date_prefix = expense_date.strftime("%Y%m%d") if expense_date else datetime.now().strftime("%Y%m%d")
+    safe_name   = original_name.replace(" ", "_")
+    dest        = INVOICE_DIR / f"{date_prefix}_{safe_name}"
     with open(dest, "wb") as f:
         f.write(pdf_bytes)
     return dest
@@ -1003,7 +1002,7 @@ def render_sidebar_add_expense(engine):
                 vendor_id   = vendor_map.get(vendor_name)
                 category_id = category_map.get(category)
                 project_id  = project_map.get(project_name)
-                inv_path    = save_invoice(pdf_file)
+                inv_path    = save_invoice(pdf_file, exp_date)
                 add_expense(engine, exp_date, vendor_id, category_id, project_id,
                             description, gross, gst, status, inv_path)
                 st.success("✅ Expense saved!")
@@ -1622,7 +1621,8 @@ def render_invoice_scanner_tab(engine):
         # Save the PDF to /invoices/
         inv_path = save_invoice_bytes(
             st.session_state["ai_pdf_bytes"],
-            st.session_state["ai_pdf_name"]
+            st.session_state["ai_pdf_name"],
+            exp_date,
         )
 
         add_expense(
@@ -1721,7 +1721,7 @@ def render_receipt_generator_tab(engine):
 
         # Save to /invoices/ folder
         filename  = f"{receipt_no}_{payee_name.strip().replace(' ','_')}.pdf"
-        inv_path  = save_invoice_bytes(pdf_bytes, filename)
+        inv_path  = save_invoice_bytes(pdf_bytes, filename, receipt_date)
 
         # Optionally log to expenses DB
         if save_to_db:
