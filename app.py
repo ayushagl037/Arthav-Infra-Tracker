@@ -228,7 +228,6 @@ def get_receipt_expense(engine, receipt_no: str):
         exps = s.query(Expense).all()
         for e in exps:
             if e.invoice_path and receipt_no in e.invoice_path:
-                # Return a plain dict so it survives outside the session
                 return {
                     "id":            e.id,
                     "date":          e.date,
@@ -242,6 +241,27 @@ def get_receipt_expense(engine, receipt_no: str):
                     "payment_status":e.payment_status,
                 }
     return None
+
+
+def get_scanned_expense(engine, expense_id: int):
+    """Fetch a scanned invoice expense row by its DB ID as a plain dict."""
+    with Session(engine) as s:
+        e = s.get(Expense, expense_id)
+        if e is None:
+            return None
+        return {
+            "id":             e.id,
+            "date":           e.date,
+            "description":    e.description,
+            "gross_amount":   e.gross_amount,
+            "gst_amount":     e.gst_amount,
+            "invoice_path":   e.invoice_path,
+            "drive_file_id":  e.drive_file_id,
+            "vendor_id":      e.vendor_id,
+            "category_id":    e.category_id,
+            "project_id":     e.project_id,
+            "payment_status": e.payment_status,
+        }
 
 
 def _migrate_add_drive_file_id(engine):
@@ -557,6 +577,19 @@ def overwrite_on_drive(file_id: str, new_filename: str, pdf_bytes: bytes) -> tup
 def gdrive_configured() -> bool:
     """Check if Google Drive credentials are available."""
     return "gdrive" in st.secrets
+
+
+def delete_from_drive(file_id: str) -> bool:
+    """Permanently delete a file from Google Drive. Returns True on success."""
+    service = get_drive_service()
+    if service is None or not file_id:
+        return False
+    try:
+        service.files().delete(fileId=file_id).execute()
+        return True
+    except Exception as e:
+        st.warning(f"Google Drive delete failed: {type(e).__name__}: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -1816,6 +1849,178 @@ def render_invoice_scanner_tab(engine):
         st.balloons()
         st.rerun()
 
+    # ── Scanned Invoices Ledger, Edit & Delete ────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">Scanned Invoices — Manage</div>',
+                unsafe_allow_html=True)
+
+    df_all = get_expenses_df(engine)
+    if not df_all.empty:
+        scanned_df = df_all[
+            df_all["invoice_path"].notna() &
+            ~df_all["invoice_path"].str.contains("AIRC-", na=False)
+        ].copy()
+    else:
+        scanned_df = pd.DataFrame()
+
+    if scanned_df.empty:
+        st.info("No AI-scanned invoices saved yet.")
+    else:
+        st.dataframe(
+            scanned_df[["id", "date", "project", "vendor", "category",
+                         "description", "gross_amount", "gst_amount",
+                         "payment_status", "invoice_path"]]
+            .rename(columns={
+                "id": "ID", "date": "Date", "project": "Project",
+                "vendor": "Vendor", "category": "Category",
+                "description": "Description", "gross_amount": "Gross (₹)",
+                "gst_amount": "GST (₹)", "payment_status": "Status",
+                "invoice_path": "File",
+            }),
+            use_container_width=True, height=300, hide_index=True,
+        )
+
+        # ── Load by ID ────────────────────────────────────────────
+        st.markdown("---")
+        st.caption("Enter the Expense ID from the table above to edit or delete it.")
+
+        load_col1, load_col2 = st.columns([1, 2])
+        with load_col1:
+            scan_load_id = st.number_input("Expense ID", min_value=1,
+                                            step=1, key="scan_load_id")
+        with load_col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            load_scan_clicked = st.button("🔍 Load Expense", key="load_scan_btn")
+
+        if load_scan_clicked:
+            rec = get_scanned_expense(engine, int(scan_load_id))
+            if rec:
+                # Verify it's actually a scanned invoice (not a receipt)
+                if rec["invoice_path"] and "AIRC-" in rec["invoice_path"]:
+                    st.error("That ID belongs to a generated receipt — use the Receipt Generator tab to edit it.")
+                else:
+                    st.session_state["editing_scan"]    = rec
+                    st.session_state["editing_scan_id"] = int(scan_load_id)
+                    st.success(f"✅ Expense #{scan_load_id} loaded — edit below.")
+            else:
+                st.error(f"No expense found with ID {scan_load_id}.")
+
+        # ── Edit form ─────────────────────────────────────────────
+        if "editing_scan" in st.session_state:
+            rec    = st.session_state["editing_scan"]
+            rec_id = st.session_state["editing_scan_id"]
+
+            vendors        = get_vendors(engine)
+            categories     = get_categories(engine)
+            projects       = get_projects(engine)
+            vendor_names   = [v.name for v in vendors]
+            category_names = [c.name for c in categories]
+            project_names  = [p.name for p in projects]
+            vendor_map     = {v.name: v.id for v in vendors}
+            category_map   = {c.name: c.id for c in categories}
+            project_map    = {p.name: p.id for p in projects}
+            id_vendor_map  = {v.id: v.name for v in vendors}
+            id_cat_map     = {c.id: c.name for c in categories}
+            id_proj_map    = {p.id: p.name for p in projects}
+
+            def _safe_idx(lst, val, fallback=0):
+                return lst.index(val) if val in lst else fallback
+
+            st.markdown(f"**Editing Expense ID: `#{rec_id}`**")
+
+            with st.form("edit_scan_form", clear_on_submit=False):
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    se_date   = st.date_input("Date", value=rec["date"],    key="se_date")
+                    se_vendor = st.selectbox(
+                        "Vendor",
+                        vendor_names,
+                        index=_safe_idx(vendor_names, id_vendor_map.get(rec["vendor_id"], "")),
+                        key="se_vendor",
+                    )
+                    se_proj   = st.selectbox(
+                        "Project", project_names,
+                        index=_safe_idx(project_names, id_proj_map.get(rec["project_id"], "Other")),
+                        key="se_proj",
+                    )
+                with sc2:
+                    se_cat    = st.selectbox(
+                        "Category", category_names,
+                        index=_safe_idx(category_names, id_cat_map.get(rec["category_id"], "")),
+                        key="se_cat",
+                    )
+                    se_gross  = st.number_input("Gross Amount (₹)",
+                                                 value=float(rec["gross_amount"]),
+                                                 min_value=0.0, step=100.0, key="se_gross")
+                    se_gst    = st.number_input("GST Amount (₹)",
+                                                 value=float(rec["gst_amount"] or 0),
+                                                 min_value=0.0, step=10.0, key="se_gst")
+                    se_status = st.selectbox("Payment Status", ["Paid", "Pending"],
+                                              index=0 if rec["payment_status"] == "Paid" else 1,
+                                              key="se_status")
+                se_desc = st.text_input("Description",
+                                         value=rec["description"] or "", key="se_desc")
+
+                sf_col1, sf_col2 = st.columns(2)
+                with sf_col1:
+                    save_scan_btn = st.form_submit_button("💾 Save Changes",
+                                                           use_container_width=True)
+                with sf_col2:
+                    cancel_scan   = st.form_submit_button("✕ Cancel",
+                                                           use_container_width=True)
+
+            if cancel_scan:
+                st.session_state.pop("editing_scan", None)
+                st.session_state.pop("editing_scan_id", None)
+                st.rerun()
+
+            if save_scan_btn:
+                if se_gross <= 0:
+                    st.error("Gross amount must be greater than 0.")
+                else:
+                    with Session(engine) as s:
+                        exp = s.get(Expense, rec_id)
+                        if exp:
+                            exp.date           = se_date
+                            exp.vendor_id      = vendor_map.get(se_vendor, exp.vendor_id)
+                            exp.category_id    = category_map.get(se_cat, exp.category_id)
+                            exp.project_id     = project_map.get(se_proj, exp.project_id)
+                            exp.description    = se_desc.strip()
+                            exp.gross_amount   = se_gross
+                            exp.gst_amount     = se_gst
+                            exp.payment_status = se_status
+                            s.commit()
+                    st.success(f"✅ Expense #{rec_id} updated successfully!")
+                    st.session_state.pop("editing_scan", None)
+                    st.session_state.pop("editing_scan_id", None)
+                    st.rerun()
+
+            # ── Danger Zone ───────────────────────────────────────
+            st.markdown("---")
+            st.markdown("**🗑 Danger Zone**")
+            st.caption("Permanently deletes this expense from the database, Google Drive, and local storage. Cannot be undone.")
+            confirm_scan_del = st.checkbox(
+                f"I confirm I want to permanently delete Expense #{rec_id}",
+                key="confirm_scan_del2",
+            )
+            if confirm_scan_del:
+                if st.button("🗑 Delete Permanently", key="del_scan_btn2", type="secondary"):
+                    with Session(engine) as s:
+                        exp = s.get(Expense, rec_id)
+                        if exp:
+                            if exp.drive_file_id:
+                                delete_from_drive(exp.drive_file_id)
+                            if exp.invoice_path:
+                                lp = Path(exp.invoice_path)
+                                if lp.exists():
+                                    lp.unlink()
+                            s.delete(exp)
+                            s.commit()
+                    st.warning(f"🗑 Expense #{rec_id} permanently deleted.")
+                    st.session_state.pop("editing_scan", None)
+                    st.session_state.pop("editing_scan_id", None)
+                    st.rerun()
+
 
 def render_receipt_generator_tab(engine):
     st.markdown('<div class="section-header">Receipt Generator</div>', unsafe_allow_html=True)
@@ -2081,6 +2286,40 @@ def render_receipt_generator_tab(engine):
                 )
                 st.session_state.pop("editing_receipt", None)
                 st.session_state.pop("editing_receipt_no", None)
+
+        # ── Delete Receipt ────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("**🗑 Danger Zone**")
+        st.caption("This will permanently delete the receipt from the database, Google Drive, and local storage. This cannot be undone.")
+
+        # Two-step confirmation to prevent accidental deletion
+        confirm = st.checkbox(f"I confirm I want to permanently delete `{rec_no}`",
+                              key="confirm_delete_receipt")
+        if confirm:
+            if st.button("🗑 Delete Receipt Permanently", key="delete_receipt_btn",
+                         type="secondary"):
+                with st.spinner("Deleting..."):
+                    # 1. Delete from Google Drive
+                    if rec.get("drive_file_id"):
+                        delete_from_drive(rec["drive_file_id"])
+
+                    # 2. Delete local file
+                    if rec.get("invoice_path"):
+                        local_file = Path(rec["invoice_path"])
+                        if local_file.exists():
+                            local_file.unlink()
+
+                    # 3. Delete from database
+                    with Session(engine) as s:
+                        exp = s.get(Expense, rec["id"])
+                        if exp:
+                            s.delete(exp)
+                            s.commit()
+
+                st.warning(f"🗑 Receipt `{rec_no}` has been permanently deleted.")
+                st.session_state.pop("editing_receipt", None)
+                st.session_state.pop("editing_receipt_no", None)
+                st.rerun()
 
 
 def render_projects_tab(engine, df: pd.DataFrame):
