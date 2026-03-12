@@ -1339,6 +1339,8 @@ def render_accounting_table(df: pd.DataFrame, engine):
     if vendor_filter != "All":
         view = view[view["vendor"] == vendor_filter]
 
+    view = view.sort_values("date", ascending=False)
+
     # ── Display columns ──────────────────────────────────────────
     display_cols = ["id", "date", "project", "vendor", "category", "description",
                     "gross_amount", "gst_amount", "total_amount",
@@ -1650,7 +1652,7 @@ def render_gst_tab(df: pd.DataFrame, engine):
         st.info("No output GST transactions logged yet. Use '🧾 Log Output GST' in the sidebar.")
     else:
         st.dataframe(
-            gst_view.rename(columns={
+            gst_view.sort_values("date", ascending=False).rename(columns={
                 "id": "ID", "date": "Date", "project": "Project",
                 "transaction_type": "Type",
                 "base_value": "Contract Value (₹)", "taxable_value": "Taxable Value (₹)",
@@ -1673,8 +1675,9 @@ def render_gst_tab(df: pd.DataFrame, engine):
     if itc_df.empty:
         st.info("No ITC-eligible expenses found.")
     else:
-        itc_display = itc_df[["date", "project", "vendor", "category",
-                               "description", "gross_amount", "gst_amount"]].rename(columns={
+        itc_display = itc_df.sort_values("date", ascending=False)[
+            ["date", "project", "vendor", "category", "description",
+             "gross_amount", "gst_amount"]].rename(columns={
             "date": "Date", "project": "Project", "vendor": "Vendor",
             "category": "Category", "description": "Description",
             "gross_amount": "Gross (₹)", "gst_amount": "GST / ITC (₹)",
@@ -1896,17 +1899,19 @@ def render_invoice_scanner_tab(engine):
     if scanned_df.empty:
         st.info("No AI-scanned invoices saved yet.")
     else:
-        display_df = scanned_df[["id", "date", "project", "vendor", "category",
-                                  "description", "gross_amount", "gst_amount",
-                                  "payment_status", "invoice_path"]].copy()
+        display_df = scanned_df.copy()
         display_df["total_amount"] = display_df["gross_amount"] + display_df["gst_amount"]
+        display_df = display_df.sort_values("date", ascending=False)
         st.dataframe(
-            display_df.rename(columns={
+            display_df[["id", "date", "project", "vendor", "category", "description",
+                         "gross_amount", "gst_amount", "total_amount",
+                         "payment_status", "invoice_path"]]
+            .rename(columns={
                 "id": "ID", "date": "Date", "project": "Project",
                 "vendor": "Vendor", "category": "Category",
                 "description": "Description", "gross_amount": "Gross (₹)",
                 "gst_amount": "GST (₹)", "total_amount": "Total (₹)",
-                "payment_status": "Status", "invoice_path": "File",
+                "payment_status": "Status", "invoice_path": "Invoice",
             }),
             use_container_width=True, height=300, hide_index=True,
         )
@@ -2182,13 +2187,18 @@ def render_receipt_generator_tab(engine):
         if not df.empty:
             receipts_df = df[df["invoice_path"].str.contains("AIRC-", na=False)].copy()
             if not receipts_df.empty:
+                receipts_df["total_amount"] = receipts_df["gross_amount"] + receipts_df["gst_amount"]
+                receipts_df = receipts_df.sort_values("date", ascending=False)
                 st.dataframe(
-                    receipts_df[["date", "project", "vendor", "category",
-                                 "description", "gross_amount", "invoice_path"]]
+                    receipts_df[["id", "date", "project", "vendor", "category",
+                                 "description", "gross_amount", "gst_amount",
+                                 "total_amount", "payment_status", "invoice_path"]]
                     .rename(columns={
-                        "date": "Date", "project": "Project", "vendor": "Payee",
-                        "category": "Category", "description": "Purpose",
-                        "gross_amount": "Amount (₹)", "invoice_path": "Receipt File"
+                        "id": "ID", "date": "Date", "project": "Project",
+                        "vendor": "Payee", "category": "Category",
+                        "description": "Purpose", "gross_amount": "Gross (₹)",
+                        "gst_amount": "GST (₹)", "total_amount": "Total (₹)",
+                        "payment_status": "Status", "invoice_path": "Invoice",
                     }),
                     use_container_width=True, height=280, hide_index=True,
                 )
