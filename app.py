@@ -538,21 +538,36 @@ def save_invoice_bytes(pdf_bytes: bytes, original_name: str, expense_date: date 
 @st.cache_resource
 def get_drive_service():
     """
-    Build and cache a Google Drive API service using credentials
-    stored in Streamlit secrets. Returns None if not configured.
+    Build and cache a Google Drive API service.
+    Uses OAuth refresh token (owned by arthavhyd@gmail.com) so files
+    are stored in their Drive quota — not the service account's.
+    Falls back to service account if OAuth creds not configured.
     """
     try:
-        from google.oauth2 import service_account
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
         from googleapiclient.discovery import build
 
+        if "gdrive_oauth" in st.secrets:
+            oauth = st.secrets["gdrive_oauth"]
+            creds = Credentials(
+                token=None,
+                refresh_token=oauth["refresh_token"],
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=oauth["client_id"],
+                client_secret=oauth["client_secret"],
+                scopes=["https://www.googleapis.com/auth/drive"],
+            )
+            creds.refresh(Request())
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        # Fallback: service account
+        from google.oauth2 import service_account
         if "gdrive" not in st.secrets:
             return None
-
         creds_dict = dict(st.secrets["gdrive"])
-        # Streamlit secrets stores multiline strings with literal \n — fix private key
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-
         creds = service_account.Credentials.from_service_account_info(
             creds_dict,
             scopes=["https://www.googleapis.com/auth/drive"],
@@ -594,9 +609,30 @@ def upload_to_drive(file_path: Path, pdf_bytes: bytes = None) -> tuple[str | Non
             body=file_metadata,
             media_body=media,
             fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
-        return uploaded.get("id"), uploaded.get("webViewLink")
+        file_id  = uploaded.get("id")
+        view_url = uploaded.get("webViewLink")
+
+        # Transfer ownership to the Gmail account so it uses their storage quota
+        try:
+            service.permissions().create(
+                fileId=file_id,
+                transferOwnership=True,
+                body={
+                    "type":         "user",
+                    "role":         "owner",
+                    "emailAddress": "arthavhyd@gmail.com",
+                },
+                supportsAllDrives=True,
+            ).execute()
+        except Exception:
+            # Ownership transfer may fail on free accounts — not critical
+            pass
+
+        return file_id, view_url
+
     except Exception as e:
         st.warning(f"Google Drive upload failed: {type(e).__name__}: {e}")
         return None, None
@@ -1291,11 +1327,9 @@ def render_sidebar_export(df: pd.DataFrame):
     if st.sidebar.button("⬇ Download Full Backup ZIP", use_container_width=True):
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            # Add all PDFs from invoices folder
             if INVOICE_DIR.exists():
                 for pdf_file in INVOICE_DIR.glob("*.pdf"):
                     zf.write(pdf_file, f"invoices/{pdf_file.name}")
-            # Add CSV export of current data
             zf.writestr("arthav_expenses.csv", df.to_csv(index=False))
         zip_buf.seek(0)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1306,6 +1340,29 @@ def render_sidebar_export(df: pd.DataFrame):
             mime="application/zip",
             use_container_width=True,
         )
+
+    # ── Google Drive test ─────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## ☁️ Google Drive")
+    if st.sidebar.button("🔍 Test Drive Connection", use_container_width=True):
+        try:
+            service = get_drive_service()
+            if service is None:
+                st.sidebar.error("❌ Drive not configured — check [gdrive] secrets.")
+            else:
+                # Try to get folder metadata
+                folder = service.files().get(
+                    fileId=GDRIVE_FOLDER,
+                    fields="id, name, owners"
+                ).execute()
+                owner = folder.get("owners", [{}])[0].get("emailAddress", "unknown")
+                st.sidebar.success(
+                    f"✅ Connected!\n\n"
+                    f"**Folder:** {folder.get('name')}\n\n"
+                    f"**Owner:** {owner}"
+                )
+        except Exception as e:
+            st.sidebar.error(f"❌ Drive error: {type(e).__name__}: {e}")
 
 
 def render_accounting_table(df: pd.DataFrame, engine):
