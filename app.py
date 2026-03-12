@@ -1731,177 +1731,153 @@ def render_invoice_scanner_tab(engine):
 
     if uploaded is None:
         st.info("👆 Upload a PDF invoice above to begin AI extraction.")
-        return
+    else:
+        pdf_bytes = uploaded.read()
 
-    pdf_bytes = uploaded.read()
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            extract_clicked = st.button("🤖 Extract with AI", use_container_width=True)
+        with col_info:
+            st.markdown(f"<span style='color:#6b7080; font-size:13px;'>📄 {uploaded.name} "
+                        f"&nbsp;·&nbsp; {len(pdf_bytes)/1024:.1f} KB</span>",
+                        unsafe_allow_html=True)
 
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        extract_clicked = st.button("🤖 Extract with AI", use_container_width=True)
-    with col_info:
-        st.markdown(f"<span style='color:#6b7080; font-size:13px;'>📄 {uploaded.name} "
-                    f"&nbsp;·&nbsp; {len(pdf_bytes)/1024:.1f} KB</span>",
-                    unsafe_allow_html=True)
+        # ── Run extraction ────────────────────────────────────────────
+        if extract_clicked:
+            with st.spinner("🔍 Claude is reading your invoice..."):
+                result = extract_invoice_with_ai(pdf_bytes, api_key)
+            if result:
+                st.session_state["ai_extracted"] = result
+                st.session_state["ai_pdf_bytes"] = pdf_bytes
+                st.session_state["ai_pdf_name"]  = uploaded.name
+                st.success("✅ Extraction complete! Review the fields below and confirm.")
+            else:
+                st.error("Extraction failed. Please check the error above.")
 
-    # ── Run extraction ────────────────────────────────────────────
-    if extract_clicked:
-        with st.spinner("🔍 Claude is reading your invoice..."):
-            result = extract_invoice_with_ai(pdf_bytes, api_key)
-        if result:
-            st.session_state["ai_extracted"] = result
-            st.session_state["ai_pdf_bytes"] = pdf_bytes
-            st.session_state["ai_pdf_name"]  = uploaded.name
-            st.success("✅ Extraction complete! Review the fields below and confirm.")
-        else:
-            st.error("Extraction failed. Please check the error above.")
-            return
+        # ── Show editable pre-filled form ─────────────────────────────
+        if "ai_extracted" in st.session_state:
+            ex = st.session_state["ai_extracted"]
 
-    # ── Show editable pre-filled form ─────────────────────────────
-    if "ai_extracted" not in st.session_state:
-        return
+            st.markdown('<div class="section-header">Extracted Data — Review & Confirm</div>',
+                        unsafe_allow_html=True)
 
-    ex = st.session_state["ai_extracted"]
+            if ex.get("confidence_notes"):
+                st.info(f"💬 AI note: {ex['confidence_notes']}")
 
-    st.markdown('<div class="section-header">Extracted Data — Review & Confirm</div>',
-                unsafe_allow_html=True)
-
-    if ex.get("confidence_notes"):
-        st.info(f"💬 AI note: {ex['confidence_notes']}")
-
-    vendors    = get_vendors(engine)
-    categories = get_categories(engine)
-    projects   = get_projects(engine)
-    vendor_names   = [v.name for v in vendors]
-    category_names = [c.name for c in categories]
-    project_names  = [p.name for p in projects]
-    vendor_map     = {v.name: v.id for v in vendors}
-    category_map   = {c.name: c.id for c in categories}
-    project_map    = {p.name: p.id for p in projects}
-
-    # Parse date safely
-    try:
-        parsed_date = date.fromisoformat(ex.get("invoice_date", ""))
-    except Exception:
-        parsed_date = date.today()
-
-    # Safe index helpers
-    def safe_idx(lst, val, fallback=0):
-        try:
-            return lst.index(val) if val in lst else fallback
-        except Exception:
-            return fallback
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**📋 Invoice Details**")
-
-        # Vendor — show extracted name but allow selecting existing or note as new
-        ai_vendor = ex.get("vendor_name", "")
-        vendor_options = ["➕ Add as new vendor"] + vendor_names
-        vendor_default = safe_idx(vendor_options, ai_vendor, 0)
-        chosen_vendor_opt = st.selectbox("Vendor", vendor_options,
-                                          index=vendor_default, key="ai_vendor_sel")
-        if chosen_vendor_opt == "➕ Add as new vendor":
-            new_vendor_name = st.text_input("New Vendor Name", value=ai_vendor, key="ai_new_vendor")
-            new_vendor_gst  = st.text_input("New Vendor GST (optional)",
-                                             value=ex.get("vendor_gst") or "", key="ai_new_gst")
-        else:
-            new_vendor_name = None
-            new_vendor_gst  = None
-
-        exp_date = st.date_input("Date", value=parsed_date, key="ai_date")
-
-        desc = st.text_input("Description",
-                              value=ex.get("description", ""), key="ai_desc")
-        invoice_num = ex.get("invoice_number") or ""
-        if invoice_num:
-            st.text_input("Invoice / Order Number", value=invoice_num,
-                          disabled=True, key="ai_invnum")
-
-    with c2:
-        st.markdown("**💰 Amounts & Classification**")
-
-        gross = st.number_input("Gross Amount (₹)",
-                                 value=float(ex.get("gross_amount", 0) or 0),
-                                 min_value=0.0, step=100.0, key="ai_gross")
-        gst   = st.number_input("GST Amount (₹)",
-                                  value=float(ex.get("gst_amount", 0) or 0),
-                                  min_value=0.0, step=10.0, key="ai_gst")
-
-        ai_cat     = ex.get("suggested_category", "Miscellaneous")
-        cat_idx    = safe_idx(category_names, ai_cat, 0)
-        chosen_cat = st.selectbox("Category", category_names,
-                                   index=cat_idx, key="ai_cat")
-
-        ai_proj     = ex.get("suggested_project", "Other")
-        proj_idx    = safe_idx(project_names, ai_proj, 0)
-        chosen_proj = st.selectbox("Project", project_names,
-                                    index=proj_idx, key="ai_proj")
-
-        ai_status   = ex.get("payment_status", "Pending")
-        status_opts = ["Paid", "Pending"]
-        stat_idx    = safe_idx(status_opts, ai_status, 1)
-        chosen_status = st.radio("Payment Status", status_opts,
-                                  index=stat_idx, horizontal=True, key="ai_status")
-
-    # ── Confidence preview ────────────────────────────────────────
-    with st.expander("🔍 View raw AI extraction output"):
-        st.json(ex)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    save_col, clear_col, _ = st.columns([1, 1, 3])
-
-    with save_col:
-        save_clicked = st.button("💾 Save to Database", use_container_width=True, key="ai_save")
-    with clear_col:
-        if st.button("🗑 Clear", use_container_width=True, key="ai_clear"):
-            for k in ["ai_extracted", "ai_pdf_bytes", "ai_pdf_name"]:
-                st.session_state.pop(k, None)
-            st.rerun()
-
-    if save_clicked:
-        # Handle new vendor creation
-        if chosen_vendor_opt == "➕ Add as new vendor":
-            if not new_vendor_name or not new_vendor_name.strip():
-                st.error("Please enter a vendor name.")
-                return
-            add_vendor(engine, new_vendor_name,
-                       new_vendor_gst or "", "")
-            # Refresh and get new vendor id
             vendors    = get_vendors(engine)
-            vendor_map = {v.name: v.id for v in vendors}
-            final_vendor_id = vendor_map.get(new_vendor_name.strip())
-        else:
-            final_vendor_id = vendor_map.get(chosen_vendor_opt)
+            categories = get_categories(engine)
+            projects   = get_projects(engine)
+            vendor_names   = [v.name for v in vendors]
+            category_names = [c.name for c in categories]
+            project_names  = [p.name for p in projects]
+            vendor_map     = {v.name: v.id for v in vendors}
+            category_map   = {c.name: c.id for c in categories}
+            project_map    = {p.name: p.id for p in projects}
 
-        final_category_id = category_map.get(chosen_cat)
-        final_project_id  = project_map.get(chosen_proj)
+            try:
+                parsed_date = date.fromisoformat(ex.get("invoice_date", ""))
+            except Exception:
+                parsed_date = date.today()
 
-        if gross <= 0:
-            st.error("Gross amount must be greater than 0.")
-            return
+            def safe_idx(lst, val, fallback=0):
+                try:
+                    return lst.index(val) if val in lst else fallback
+                except Exception:
+                    return fallback
 
-        # Save the PDF to /invoices/
-        inv_path = save_invoice_bytes(
-            st.session_state["ai_pdf_bytes"],
-            st.session_state["ai_pdf_name"],
-            exp_date,
-        )
-        drive_fid, _ = upload_to_drive(inv_path, st.session_state["ai_pdf_bytes"])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**📋 Invoice Details**")
+                ai_vendor = ex.get("vendor_name", "")
+                vendor_options = ["➕ Add as new vendor"] + vendor_names
+                vendor_default = safe_idx(vendor_options, ai_vendor, 0)
+                chosen_vendor_opt = st.selectbox("Vendor", vendor_options,
+                                                  index=vendor_default, key="ai_vendor_sel")
+                if chosen_vendor_opt == "➕ Add as new vendor":
+                    new_vendor_name = st.text_input("New Vendor Name", value=ai_vendor, key="ai_new_vendor")
+                    new_vendor_gst  = st.text_input("New Vendor GST (optional)",
+                                                     value=ex.get("vendor_gst") or "", key="ai_new_gst")
+                else:
+                    new_vendor_name = None
+                    new_vendor_gst  = None
 
-        add_expense(
-            engine, exp_date,
-            final_vendor_id, final_category_id, final_project_id,
-            desc, gross, gst, chosen_status, inv_path, drive_fid
-        )
+                exp_date = st.date_input("Date", value=parsed_date, key="ai_date")
+                desc = st.text_input("Description", value=ex.get("description", ""), key="ai_desc")
+                invoice_num = ex.get("invoice_number") or ""
+                if invoice_num:
+                    st.text_input("Invoice / Order Number", value=invoice_num,
+                                  disabled=True, key="ai_invnum")
 
-        # Clear session state
-        for k in ["ai_extracted", "ai_pdf_bytes", "ai_pdf_name"]:
-            st.session_state.pop(k, None)
+            with c2:
+                st.markdown("**💰 Amounts & Classification**")
+                gross = st.number_input("Gross Amount (₹)",
+                                         value=float(ex.get("gross_amount", 0) or 0),
+                                         min_value=0.0, step=100.0, key="ai_gross")
+                gst   = st.number_input("GST Amount (₹)",
+                                          value=float(ex.get("gst_amount", 0) or 0),
+                                          min_value=0.0, step=10.0, key="ai_gst")
+                ai_cat     = ex.get("suggested_category", "Miscellaneous")
+                cat_idx    = safe_idx(category_names, ai_cat, 0)
+                chosen_cat = st.selectbox("Category", category_names,
+                                           index=cat_idx, key="ai_cat")
+                ai_proj     = ex.get("suggested_project", "Other")
+                proj_idx    = safe_idx(project_names, ai_proj, 0)
+                chosen_proj = st.selectbox("Project", project_names,
+                                            index=proj_idx, key="ai_proj")
+                ai_status   = ex.get("payment_status", "Pending")
+                status_opts = ["Paid", "Pending"]
+                stat_idx    = safe_idx(status_opts, ai_status, 1)
+                chosen_status = st.radio("Payment Status", status_opts,
+                                          index=stat_idx, horizontal=True, key="ai_status")
 
-        st.success("✅ Expense saved successfully from AI extraction!")
-        st.balloons()
-        st.rerun()
+            with st.expander("🔍 View raw AI extraction output"):
+                st.json(ex)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            save_col, clear_col, _ = st.columns([1, 1, 3])
+
+            with save_col:
+                save_clicked = st.button("💾 Save to Database", use_container_width=True, key="ai_save")
+            with clear_col:
+                if st.button("🗑 Clear", use_container_width=True, key="ai_clear"):
+                    for k in ["ai_extracted", "ai_pdf_bytes", "ai_pdf_name"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+            if save_clicked:
+                if chosen_vendor_opt == "➕ Add as new vendor":
+                    if not new_vendor_name or not new_vendor_name.strip():
+                        st.error("Please enter a vendor name.")
+                    else:
+                        add_vendor(engine, new_vendor_name, new_vendor_gst or "", "")
+                        vendors    = get_vendors(engine)
+                        vendor_map = {v.name: v.id for v in vendors}
+                        final_vendor_id = vendor_map.get(new_vendor_name.strip())
+                else:
+                    final_vendor_id = vendor_map.get(chosen_vendor_opt)
+
+                final_category_id = category_map.get(chosen_cat)
+                final_project_id  = project_map.get(chosen_proj)
+
+                if gross <= 0:
+                    st.error("Gross amount must be greater than 0.")
+                else:
+                    inv_path = save_invoice_bytes(
+                        st.session_state["ai_pdf_bytes"],
+                        st.session_state["ai_pdf_name"],
+                        exp_date,
+                    )
+                    drive_fid, _ = upload_to_drive(inv_path, st.session_state["ai_pdf_bytes"])
+                    add_expense(
+                        engine, exp_date,
+                        final_vendor_id, final_category_id, final_project_id,
+                        desc, gross, gst, chosen_status, inv_path, drive_fid
+                    )
+                    for k in ["ai_extracted", "ai_pdf_bytes", "ai_pdf_name"]:
+                        st.session_state.pop(k, None)
+                    st.success("✅ Expense saved successfully from AI extraction!")
+                    st.balloons()
+                    st.rerun()
 
     # ── Scanned Invoices Ledger, Edit & Delete ────────────────────
     st.markdown("---")
