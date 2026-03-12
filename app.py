@@ -1558,6 +1558,194 @@ def render_sidebar_add_vendor(engine):
                 st.rerun()
 
 
+def generate_ca_report_pdf(df: pd.DataFrame, month_label: str) -> bytes:
+    """Generate a professional monthly expense report PDF for the CA."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                    Paragraph, Spacer, HRFlowable)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    buf   = io.BytesIO()
+    doc   = SimpleDocTemplate(buf, pagesize=A4,
+                               leftMargin=12*mm, rightMargin=12*mm,
+                               topMargin=12*mm, bottomMargin=12*mm)
+    NAVY  = colors.HexColor("#0a1628")
+    GOLD  = colors.HexColor("#c9a84c")
+    LGREY = colors.HexColor("#f4f4f4")
+    RED   = colors.HexColor("#e74c3c")
+    GREEN = colors.HexColor("#27ae60")
+
+    styles = getSampleStyleSheet()
+    title_s = ParagraphStyle("t", fontSize=18, textColor=GOLD,
+                              fontName="Helvetica-Bold", spaceAfter=2)
+    sub_s   = ParagraphStyle("s", fontSize=10, textColor=colors.grey,
+                              fontName="Helvetica", spaceAfter=2)
+    foot_s  = ParagraphStyle("f", fontSize=7, textColor=colors.grey,
+                              fontName="Helvetica")
+
+    story = []
+
+    # ── Header ────────────────────────────────────────────────────
+    story.append(Paragraph("ARTHAV INFRA LLP", title_s))
+    story.append(Paragraph(f"Monthly Expense Report — {month_label}", sub_s))
+    story.append(Paragraph(
+        f"Generated on {date.today().strftime('%d %b %Y')}  |  "
+        f"For CA submission", sub_s
+    ))
+    story.append(HRFlowable(width="100%", thickness=1, color=GOLD, spaceAfter=6))
+
+    # ── Summary metrics ───────────────────────────────────────────
+    total_gross   = df["gross_amount"].sum()
+    total_gst     = df["gst_amount"].sum()
+    total_total   = df["total_amount"].sum()
+    paid_gross    = df[df["payment_status"] == "Paid"]["gross_amount"].sum()
+    pending_gross = df[df["payment_status"] == "Pending"]["gross_amount"].sum()
+    num_invoices  = df["invoice_path"].notna().sum()
+
+    summary_data = [
+        ["Total Expenses", "Gross Spend", "GST (ITC)", "Total Outflow", "Paid", "Pending"],
+        [
+            str(len(df)),
+            f"Rs.{total_gross:,.2f}",
+            f"Rs.{total_gst:,.2f}",
+            f"Rs.{total_total:,.2f}",
+            f"Rs.{paid_gross:,.2f}",
+            f"Rs.{pending_gross:,.2f}",
+        ],
+    ]
+    sum_t = Table(summary_data, colWidths=[30*mm] * 6)
+    sum_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0), NAVY),
+        ("TEXTCOLOR",     (0,0), (-1,0), GOLD),
+        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTNAME",      (0,1), (-1,1), "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0), (-1,-1), 8),
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("BACKGROUND",    (0,1), (-1,1), LGREY),
+        ("TOPPADDING",    (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("GRID",          (0,0), (-1,-1), 0.4, colors.white),
+    ]))
+    story.append(sum_t)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Project-wise subtotals ────────────────────────────────────
+    story.append(Paragraph("Project-wise Breakdown", ParagraphStyle(
+        "ph", fontSize=10, fontName="Helvetica-Bold",
+        textColor=NAVY, spaceAfter=3
+    )))
+    proj_summary = (
+        df.groupby("project")
+        .agg(count=("id","count"),
+             gross=("gross_amount","sum"),
+             gst=("gst_amount","sum"),
+             total=("total_amount","sum"))
+        .reset_index()
+    )
+    proj_data = [["Project", "# Expenses", "Gross (Rs.)", "GST (Rs.)", "Total (Rs.)"]]
+    for _, r in proj_summary.iterrows():
+        proj_data.append([
+            str(r["project"]),
+            str(int(r["count"])),
+            f"{r['gross']:,.2f}",
+            f"{r['gst']:,.2f}",
+            f"{r['total']:,.2f}",
+        ])
+    proj_data.append([
+        "TOTAL", str(len(df)),
+        f"{total_gross:,.2f}",
+        f"{total_gst:,.2f}",
+        f"{total_total:,.2f}",
+    ])
+    proj_t = Table(proj_data, colWidths=[65*mm, 25*mm, 40*mm, 35*mm, 40*mm])
+    proj_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0), NAVY),
+        ("TEXTCOLOR",     (0,0), (-1,0), GOLD),
+        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+        ("BACKGROUND",    (0,-1), (-1,-1), colors.HexColor("#e8f5e9")),
+        ("FONTSIZE",      (0,0), (-1,-1), 8),
+        ("ALIGN",         (1,0), (-1,-1), "RIGHT"),
+        ("ROWBACKGROUNDS",(0,1), (-1,-2), [colors.white, LGREY]),
+        ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#cccccc")),
+        ("TOPPADDING",    (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    story.append(proj_t)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Full expense ledger ───────────────────────────────────────
+    story.append(Paragraph("Detailed Expense Ledger", ParagraphStyle(
+        "ph2", fontSize=10, fontName="Helvetica-Bold",
+        textColor=NAVY, spaceAfter=3
+    )))
+
+    headers = ["ID", "Date", "Project", "Vendor", "Category",
+               "Description", "Gross", "GST", "Total", "Status", "Invoice"]
+    ledger_data = [headers]
+    for _, r in df.sort_values("date").iterrows():
+        inv = str(r["invoice_path"] or "—")
+        # Show just the filename, not the full path
+        inv = inv.split("/")[-1] if "/" in inv else inv
+        if len(inv) > 25:
+            inv = inv[:22] + "..."
+        desc = str(r["description"] or "")
+        if len(desc) > 35:
+            desc = desc[:32] + "..."
+        ledger_data.append([
+            str(r["id"]),
+            str(r["date"]),
+            str(r["project"] or ""),
+            str(r["vendor"] or ""),
+            str(r["category"] or ""),
+            desc,
+            f"{r['gross_amount']:,.0f}",
+            f"{r['gst_amount']:,.0f}",
+            f"{r['total_amount']:,.0f}",
+            str(r["payment_status"] or ""),
+            inv,
+        ])
+    # Totals row
+    ledger_data.append([
+        "", "TOTAL", "", "", "", "",
+        f"{total_gross:,.0f}",
+        f"{total_gst:,.0f}",
+        f"{total_total:,.0f}",
+        "", "",
+    ])
+
+    col_w = [10*mm, 20*mm, 28*mm, 28*mm, 22*mm,
+             38*mm, 16*mm, 14*mm, 16*mm, 16*mm, 30*mm]
+    led_t = Table(ledger_data, colWidths=col_w, repeatRows=1)
+    led_t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0), NAVY),
+        ("TEXTCOLOR",     (0,0), (-1,0), GOLD),
+        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+        ("BACKGROUND",    (0,-1), (-1,-1), colors.HexColor("#e8f5e9")),
+        ("FONTSIZE",      (0,0), (-1,-1), 6.5),
+        ("ALIGN",         (6,0), (8,-1), "RIGHT"),
+        ("ROWBACKGROUNDS",(0,1), (-1,-2), [colors.white, LGREY]),
+        ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
+        ("TOPPADDING",    (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    story.append(led_t)
+    story.append(Spacer(1, 8*mm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(
+        f"Arthav Infra LLP  |  {month_label} Expense Report  |  "
+        f"Total {len(df)} transactions  |  Invoices on file: {num_invoices}",
+        foot_s
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 def render_sidebar_export(df: pd.DataFrame):
     st.sidebar.markdown("---")
     st.sidebar.markdown("## 📤 Export Data")
@@ -1575,6 +1763,39 @@ def render_sidebar_export(df: pd.DataFrame):
         st.download_button("⬇ Excel", data=xl_bytes,
                            file_name="arthav_expenses.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ── CA Monthly Report ─────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("## 📋 CA Monthly Report")
+    st.sidebar.caption("Generate a PDF expense report for your CA.")
+
+    # Build list of available months from the data
+    if not df.empty:
+        df["_month"] = pd.to_datetime(df["date"]).dt.to_period("M")
+        available_months = sorted(df["_month"].unique(), reverse=True)
+        month_labels = [str(m) for m in available_months]
+        selected_month_str = st.sidebar.selectbox(
+            "Select Month", month_labels, key="ca_report_month"
+        )
+        if st.sidebar.button("📄 Generate CA Report PDF",
+                              use_container_width=True, key="gen_ca_report"):
+            month_df = df[df["_month"].astype(str) == selected_month_str].copy()
+            month_df = month_df.drop(columns=["_month"], errors="ignore")
+            if month_df.empty:
+                st.sidebar.warning("No expenses for this month.")
+            else:
+                with st.spinner("Generating PDF..."):
+                    pdf_bytes = generate_ca_report_pdf(month_df, selected_month_str)
+                fname = f"Arthav_Infra_CA_Report_{selected_month_str}.pdf"
+                st.sidebar.download_button(
+                    label=f"⬇ Download {selected_month_str} Report",
+                    data=pdf_bytes,
+                    file_name=fname,
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="dl_ca_report",
+                )
+        df.drop(columns=["_month"], errors="ignore", inplace=True)
 
     # ── Full backup ZIP ───────────────────────────────────────────
     st.sidebar.markdown("---")
@@ -1606,7 +1827,6 @@ def render_sidebar_export(df: pd.DataFrame):
             if service is None:
                 st.sidebar.error("❌ Drive not configured — check [gdrive] secrets.")
             else:
-                # Try to get folder metadata
                 folder = service.files().get(
                     fileId=GDRIVE_FOLDER,
                     fields="id, name, owners"
@@ -1637,15 +1857,14 @@ def render_accounting_table(df: pd.DataFrame, engine):
             "total_credit":  "total_amount",
             "invoice_path":  "invoice_path",
         }).copy()
-        cn_rows["gross_amount"] = -cn_rows["gross_amount"]
-        cn_rows["gst_amount"]   = -cn_rows["gst_amount"]
-        cn_rows["total_amount"] = -cn_rows["total_amount"]
+        cn_rows["gross_amount"]   = -cn_rows["gross_amount"]
+        cn_rows["gst_amount"]     = -cn_rows["gst_amount"]
+        cn_rows["total_amount"]   = -cn_rows["total_amount"]
         cn_rows["payment_status"] = "Credit Note"
-        cn_rows["id"] = cn_rows["id"].apply(lambda x: f"CN-{x}")
-        cn_rows["description"] = cn_rows["description"].apply(
+        cn_rows["id"]             = cn_rows["id"].apply(lambda x: f"CN-{x}")
+        cn_rows["description"]    = cn_rows["description"].apply(
             lambda x: f"[CREDIT] {x}" if x else "[CREDIT NOTE]"
         )
-        # Align columns
         for col in ["id", "date", "project", "vendor", "category", "description",
                     "gross_amount", "gst_amount", "total_amount",
                     "payment_status", "invoice_path"]:
@@ -1662,20 +1881,20 @@ def render_accounting_table(df: pd.DataFrame, engine):
     else:
         combined = df.copy()
 
-    # ── Filters row ──────────────────────────────────────────────
-    fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 2])
+    # ── Filters ───────────────────────────────────────────────────
+    fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
-        status_filter = st.selectbox("Filter by Status",
-                                      ["All", "Paid", "Pending", "Credit Note"])
+        status_filter = st.selectbox("Status", ["All", "Paid", "Pending", "Credit Note"],
+                                      key="ledger_status")
     with fc2:
-        proj_options  = ["All"] + sorted(combined["project"].dropna().unique().tolist())
-        proj_filter   = st.selectbox("Filter by Project", proj_options)
+        proj_options = ["All"] + sorted(combined["project"].dropna().unique().tolist())
+        proj_filter  = st.selectbox("Project", proj_options, key="ledger_proj")
     with fc3:
         cat_options = ["All"] + sorted(combined["category"].dropna().unique().tolist())
-        cat_filter  = st.selectbox("Filter by Category", cat_options)
+        cat_filter  = st.selectbox("Category", cat_options, key="ledger_cat")
     with fc4:
         vendor_options = ["All"] + sorted(combined["vendor"].dropna().unique().tolist())
-        vendor_filter  = st.selectbox("Filter by Vendor", vendor_options)
+        vendor_filter  = st.selectbox("Vendor", vendor_options, key="ledger_vendor")
 
     view = combined.copy()
     if status_filter != "All":
@@ -1686,10 +1905,8 @@ def render_accounting_table(df: pd.DataFrame, engine):
         view = view[view["category"] == cat_filter]
     if vendor_filter != "All":
         view = view[view["vendor"] == vendor_filter]
-
     view = view.sort_values("date", ascending=False)
 
-    # ── Display columns ──────────────────────────────────────────
     display_cols = ["id", "date", "project", "vendor", "category", "description",
                     "gross_amount", "gst_amount", "total_amount",
                     "payment_status", "invoice_path"]
@@ -1702,25 +1919,164 @@ def render_accounting_table(df: pd.DataFrame, engine):
             "total_amount": "Total (₹)", "payment_status": "Status",
             "invoice_path": "Invoice"
         }),
-        use_container_width=True,
-        height=420,
+        use_container_width=True, height=400,
     )
 
-    # ── Quick actions ─────────────────────────────────────────────
-    st.markdown('<div class="section-header">Quick Actions</div>', unsafe_allow_html=True)
-    qa1, qa2, qa3 = st.columns([1.5, 1.5, 1])
-    with qa1:
-        mark_id = st.number_input("Expense ID to mark Paid", min_value=1, step=1, key="mark_id")
-        if st.button("Mark as Paid"):
-            update_payment_status(engine, int(mark_id), "Paid")
-            st.success(f"Expense #{mark_id} marked as Paid.")
-            st.rerun()
-    with qa2:
-        del_id = st.number_input("Expense ID to delete", min_value=1, step=1, key="del_id")
-        if st.button("🗑 Delete", type="secondary"):
-            delete_expense(engine, int(del_id))
-            st.warning(f"Expense #{del_id} deleted.")
-            st.rerun()
+    st.markdown("---")
+
+    # ── Inline Edit | Bulk Delete tabs ───────────────────────────
+    action_tab1, action_tab2 = st.tabs(["✏️ Inline Edit", "🗑 Bulk Delete"])
+
+    # ── INLINE EDIT ───────────────────────────────────────────────
+    with action_tab1:
+        st.caption("Load any expense by ID, edit fields directly, and save changes.")
+        vendors    = get_vendors(engine)
+        categories = get_categories(engine)
+        projects   = get_projects(engine)
+        vendor_names   = [v.name for v in vendors]
+        category_names = [c.name for c in categories]
+        project_names  = [p.name for p in projects]
+        vendor_map     = {v.name: v.id for v in vendors}
+        category_map   = {c.name: c.id for c in categories}
+        project_map    = {p.name: p.id for p in projects}
+        id_vendor_map  = {v.id: v.name for v in vendors}
+        id_cat_map     = {c.id: c.name for c in categories}
+        id_proj_map    = {p.id: p.name for p in projects}
+
+        def safe_idx(lst, val, fallback=0):
+            return lst.index(val) if val in lst else fallback
+
+        ie1, ie2 = st.columns([1, 3])
+        with ie1:
+            edit_id = st.number_input("Expense ID", min_value=1, step=1, key="inline_edit_id")
+        with ie2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            load_edit = st.button("🔍 Load", key="load_inline_edit")
+
+        if load_edit:
+            with Session(engine) as s:
+                exp = s.get(Expense, int(edit_id))
+                if exp:
+                    st.session_state["inline_edit_rec"] = {
+                        "id": exp.id, "date": exp.date,
+                        "description": exp.description or "",
+                        "gross_amount": exp.gross_amount,
+                        "gst_amount": exp.gst_amount,
+                        "payment_status": exp.payment_status,
+                        "vendor_id": exp.vendor_id,
+                        "category_id": exp.category_id,
+                        "project_id": exp.project_id,
+                    }
+                    st.success(f"Loaded Expense #{exp.id}")
+                else:
+                    st.error(f"No expense found with ID #{edit_id}")
+
+        if "inline_edit_rec" in st.session_state:
+            rec = st.session_state["inline_edit_rec"]
+            st.markdown(f"**Editing Expense #{rec['id']}**")
+            with st.form("inline_edit_form"):
+                ef1, ef2 = st.columns(2)
+                with ef1:
+                    e_date   = st.date_input("Date", value=rec["date"], key="ie_date")
+                    e_vendor = st.selectbox("Vendor", vendor_names,
+                                             index=safe_idx(vendor_names,
+                                                            id_vendor_map.get(rec["vendor_id"], ""), 0),
+                                             key="ie_vendor")
+                    e_proj   = st.selectbox("Project", project_names,
+                                             index=safe_idx(project_names,
+                                                            id_proj_map.get(rec["project_id"], ""), 0),
+                                             key="ie_proj")
+                    e_cat    = st.selectbox("Category", category_names,
+                                             index=safe_idx(category_names,
+                                                            id_cat_map.get(rec["category_id"], ""), 0),
+                                             key="ie_cat")
+                with ef2:
+                    e_desc   = st.text_input("Description", value=rec["description"], key="ie_desc")
+                    e_gross  = st.number_input("Gross (₹)", value=float(rec["gross_amount"]),
+                                                min_value=0.0, step=100.0, key="ie_gross")
+                    e_gst    = st.number_input("GST (₹)", value=float(rec["gst_amount"]),
+                                                min_value=0.0, step=10.0, key="ie_gst")
+                    e_status = st.radio("Status", ["Paid", "Pending"],
+                                         index=0 if rec["payment_status"] == "Paid" else 1,
+                                         horizontal=True, key="ie_status")
+
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    save_edit = st.form_submit_button("💾 Save Changes", use_container_width=True)
+                with sc2:
+                    cancel_edit = st.form_submit_button("✕ Cancel", use_container_width=True)
+
+            if save_edit:
+                warnings = validate_gst_amount(e_gross, e_gst)
+                show_validation_warnings(warnings)
+                with Session(engine) as s:
+                    exp = s.get(Expense, rec["id"])
+                    if exp:
+                        exp.date        = e_date
+                        exp.vendor_id   = vendor_map.get(e_vendor)
+                        exp.project_id  = project_map.get(e_proj)
+                        exp.category_id = category_map.get(e_cat)
+                        exp.description = e_desc
+                        exp.gross_amount = e_gross
+                        exp.gst_amount   = e_gst
+                        exp.payment_status = e_status
+                        s.commit()
+                st.session_state.pop("inline_edit_rec", None)
+                st.success(f"✅ Expense #{rec['id']} updated.")
+                st.rerun()
+
+            if cancel_edit:
+                st.session_state.pop("inline_edit_rec", None)
+                st.rerun()
+
+    # ── BULK DELETE ───────────────────────────────────────────────
+    with action_tab2:
+        st.caption("Enter comma-separated Expense IDs to delete multiple records at once.")
+        bd1, bd2 = st.columns([3, 1])
+        with bd1:
+            bulk_ids_input = st.text_input("Expense IDs (comma-separated)",
+                                            placeholder="e.g. 12, 15, 23, 31",
+                                            key="bulk_delete_ids")
+        with bd2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            preview_bulk = st.button("🔍 Preview", key="preview_bulk")
+
+        if preview_bulk and bulk_ids_input.strip():
+            try:
+                id_list = [int(x.strip()) for x in bulk_ids_input.split(",") if x.strip()]
+                with Session(engine) as s:
+                    to_delete = s.query(Expense).filter(Expense.id.in_(id_list)).all()
+                if to_delete:
+                    preview_df = pd.DataFrame([{
+                        "ID": e.id, "Date": e.date,
+                        "Description": e.description,
+                        "Gross (₹)": e.gross_amount,
+                    } for e in to_delete])
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                    st.session_state["bulk_delete_confirmed_ids"] = id_list
+                else:
+                    st.warning("No matching expenses found for those IDs.")
+            except ValueError:
+                st.error("Please enter valid comma-separated numbers.")
+
+        if "bulk_delete_confirmed_ids" in st.session_state:
+            id_list = st.session_state["bulk_delete_confirmed_ids"]
+            confirm_bulk = st.checkbox(
+                f"I confirm I want to permanently delete {len(id_list)} expense(s)",
+                key="confirm_bulk_delete"
+            )
+            if confirm_bulk:
+                if st.button("🗑 Delete All", type="secondary", key="exec_bulk_delete"):
+                    with Session(engine) as s:
+                        s.query(Expense).filter(Expense.id.in_(id_list)).delete(
+                            synchronize_session=False
+                        )
+                        s.commit()
+                    st.session_state.pop("bulk_delete_confirmed_ids", None)
+                    st.warning(f"🗑 {len(id_list)} expense(s) deleted.")
+                    st.rerun()
+
+
 
 
 def render_analytics_tab(engine, df: pd.DataFrame):
@@ -1729,23 +2085,108 @@ def render_analytics_tab(engine, df: pd.DataFrame):
         st.info("Add some expenses to see analytics.")
         return
 
-    # Use net spend (credits subtracted)
     net_df = get_net_spend_df(engine)
     cn_df  = get_credit_notes_df(engine)
     if not cn_df.empty:
         st.info(f"📉 Analytics reflect net spend after subtracting "
                 f"₹{cn_df['total_credit'].sum():,.2f} in credit notes.")
 
+    # ── Charts ────────────────────────────────────────────────────
     ac1, ac2 = st.columns(2)
     with ac1:
         st.markdown("**Net Spend by Project**")
         proj_spend = net_df.groupby("project")["gross_amount"].sum().sort_values(ascending=False)
         st.bar_chart(proj_spend)
-
     with ac2:
         st.markdown("**Net Spend by Category**")
         cat_spend = net_df.groupby("category")["gross_amount"].sum().sort_values(ascending=False)
         st.bar_chart(cat_spend)
+
+    ac3, ac4 = st.columns(2)
+    with ac3:
+        st.markdown("**Net Spend by Vendor**")
+        vendor_spend = net_df.groupby("vendor")["gross_amount"].sum().sort_values(ascending=False).head(10)
+        st.bar_chart(vendor_spend)
+    with ac4:
+        st.markdown("**Monthly Trend**")
+        net_df["month"] = pd.to_datetime(net_df["date"]).dt.to_period("M").astype(str)
+        monthly = net_df.groupby("month")[["gross_amount", "gst_amount"]].sum()
+        st.bar_chart(monthly)
+
+    # ── Monthly P&L Summary ───────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">Monthly P&L Summary</div>', unsafe_allow_html=True)
+    st.caption("Gross spend vs output GST collected — ready to share with your CA.")
+
+    gst_df = get_gst_transactions_df(engine)
+
+    # Build month list from expenses
+    net_df["month_period"] = pd.to_datetime(net_df["date"]).dt.to_period("M")
+    all_months = sorted(net_df["month_period"].unique(), reverse=True)
+
+    if not all_months:
+        st.info("No data available for P&L.")
+    else:
+        pl_rows = []
+        for month in all_months:
+            month_str = str(month)
+            month_exp = net_df[net_df["month_period"] == month]
+            gross_spend  = month_exp["gross_amount"].sum()
+            gst_paid     = month_exp["gst_amount"].sum()
+            total_spend  = month_exp["total_amount"].sum()
+            paid_spend   = month_exp[month_exp["payment_status"] == "Paid"]["gross_amount"].sum()
+            pending      = month_exp[month_exp["payment_status"] == "Pending"]["gross_amount"].sum()
+
+            output_gst = 0.0
+            if not gst_df.empty and "date" in gst_df.columns:
+                gst_month = gst_df[
+                    pd.to_datetime(gst_df["date"]).dt.to_period("M").astype(str) == month_str
+                ]
+                output_gst = gst_month["output_gst"].sum() if not gst_month.empty else 0.0
+
+            net_gst = output_gst - gst_paid  # positive = liability, negative = ITC surplus
+
+            pl_rows.append({
+                "Month":          month_str,
+                "Gross Spend":    gross_spend,
+                "GST Paid (ITC)": gst_paid,
+                "Total Outflow":  total_spend,
+                "Paid":           paid_spend,
+                "Pending":        pending,
+                "Output GST":     output_gst,
+                "Net GST Position": net_gst,
+            })
+
+        pl_df = pd.DataFrame(pl_rows)
+
+        # Summary cards for current month
+        if pl_rows:
+            cur = pl_rows[0]
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            with sm1:
+                st.metric("This Month Gross", f"₹{cur['Gross Spend']:,.0f}")
+            with sm2:
+                st.metric("ITC Available", f"₹{cur['GST Paid (ITC)']:,.0f}")
+            with sm3:
+                st.metric("Output GST", f"₹{cur['Output GST']:,.0f}")
+            with sm4:
+                label = "GST Payable" if cur["Net GST Position"] > 0 else "ITC Surplus"
+                st.metric(label, f"₹{abs(cur['Net GST Position']):,.0f}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Format for display
+        fmt_df = pl_df.copy()
+        for col in ["Gross Spend", "GST Paid (ITC)", "Total Outflow",
+                    "Paid", "Pending", "Output GST", "Net GST Position"]:
+            fmt_df[col] = fmt_df[col].map("₹{:,.2f}".format)
+        st.dataframe(fmt_df, use_container_width=True, hide_index=True, height=300)
+
+        # Export P&L
+        pl_bytes = pl_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇ Export P&L CSV", data=pl_bytes,
+                           file_name=f"arthav_pl_{date.today().strftime('%Y%m')}.csv",
+                           mime="text/csv")
 
     ac3, ac4 = st.columns(2)
     with ac3:
@@ -1772,6 +2213,163 @@ def render_vendors_tab(engine):
         "Contact": v.contact_person or "—"
     } for v in vendors])
     st.dataframe(vdf, use_container_width=True, hide_index=True)
+
+    # ── Vendor Statement PDF ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">Vendor Statement</div>', unsafe_allow_html=True)
+    st.caption("Generate a PDF statement of all transactions with a specific vendor for a date range.")
+
+    vs1, vs2, vs3, vs4 = st.columns([2, 1, 1, 1])
+    vendor_names = [v.name for v in vendors]
+    with vs1:
+        stmt_vendor = st.selectbox("Select Vendor", vendor_names, key="stmt_vendor")
+    with vs2:
+        stmt_from = st.date_input("From", value=date.today().replace(month=1, day=1),
+                                   key="stmt_from")
+    with vs3:
+        stmt_to   = st.date_input("To", value=date.today(), key="stmt_to")
+    with vs4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        gen_stmt  = st.button("📄 Generate Statement", key="gen_stmt_btn",
+                               use_container_width=True)
+
+    if gen_stmt:
+        df_all = get_expenses_df(engine)
+        if df_all.empty:
+            st.warning("No expenses found.")
+        else:
+            stmt_df = df_all[
+                (df_all["vendor"] == stmt_vendor) &
+                (pd.to_datetime(df_all["date"]).dt.date >= stmt_from) &
+                (pd.to_datetime(df_all["date"]).dt.date <= stmt_to)
+            ].sort_values("date")
+
+            if stmt_df.empty:
+                st.warning(f"No transactions found for {stmt_vendor} in this date range.")
+            else:
+                # Generate PDF using reportlab
+                from reportlab.lib.pagesizes import A4
+                from reportlab.lib import colors
+                from reportlab.lib.units import mm
+                from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                                Paragraph, Spacer)
+                from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+                buf = io.BytesIO()
+                doc = SimpleDocTemplate(buf, pagesize=A4,
+                                        leftMargin=15*mm, rightMargin=15*mm,
+                                        topMargin=15*mm, bottomMargin=15*mm)
+                styles    = getSampleStyleSheet()
+                NAVY      = colors.HexColor("#0a1628")
+                GOLD      = colors.HexColor("#c9a84c")
+                LIGHTGREY = colors.HexColor("#f5f5f5")
+
+                title_style = ParagraphStyle("title", parent=styles["Normal"],
+                                              fontSize=16, textColor=GOLD,
+                                              spaceAfter=4, fontName="Helvetica-Bold")
+                sub_style   = ParagraphStyle("sub", parent=styles["Normal"],
+                                              fontSize=10, textColor=colors.grey,
+                                              spaceAfter=2)
+                normal      = ParagraphStyle("norm", parent=styles["Normal"],
+                                              fontSize=9, textColor=colors.black)
+
+                story = []
+                story.append(Paragraph("ARTHAV INFRA LLP", title_style))
+                story.append(Paragraph("Vendor Statement", sub_style))
+                story.append(Paragraph(
+                    f"Vendor: <b>{stmt_vendor}</b> &nbsp;|&nbsp; "
+                    f"Period: {stmt_from.strftime('%d %b %Y')} to {stmt_to.strftime('%d %b %Y')}",
+                    sub_style
+                ))
+                story.append(Spacer(1, 6*mm))
+
+                # Summary metrics
+                total_gross = stmt_df["gross_amount"].sum()
+                total_gst   = stmt_df["gst_amount"].sum()
+                total_total = stmt_df["total_amount"].sum()
+                paid_amt    = stmt_df[stmt_df["payment_status"] == "Paid"]["gross_amount"].sum()
+                pending_amt = stmt_df[stmt_df["payment_status"] == "Pending"]["gross_amount"].sum()
+
+                summary_data = [
+                    ["Total Transactions", "Gross Spend", "GST Paid", "Total", "Paid", "Pending"],
+                    [str(len(stmt_df)),
+                     f"₹{total_gross:,.2f}", f"₹{total_gst:,.2f}",
+                     f"₹{total_total:,.2f}", f"₹{paid_amt:,.2f}", f"₹{pending_amt:,.2f}"],
+                ]
+                sum_table = Table(summary_data, colWidths=[30*mm]*6)
+                sum_table.setStyle(TableStyle([
+                    ("BACKGROUND",    (0,0), (-1,0), NAVY),
+                    ("TEXTCOLOR",     (0,0), (-1,0), GOLD),
+                    ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+                    ("FONTSIZE",      (0,0), (-1,-1), 8),
+                    ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+                    ("BACKGROUND",    (0,1), (-1,1), LIGHTGREY),
+                    ("GRID",          (0,0), (-1,-1), 0.5, colors.white),
+                    ("ROWBACKGROUNDS",(0,1), (-1,-1), [LIGHTGREY, colors.white]),
+                    ("TOPPADDING",    (0,0), (-1,-1), 4),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+                ]))
+                story.append(sum_table)
+                story.append(Spacer(1, 6*mm))
+
+                # Transaction table
+                headers = ["Date", "Project", "Category", "Description",
+                           "Gross (₹)", "GST (₹)", "Total (₹)", "Status"]
+                rows = [headers]
+                for _, r in stmt_df.iterrows():
+                    rows.append([
+                        str(r["date"]),
+                        str(r["project"] or ""),
+                        str(r["category"] or ""),
+                        str(r["description"] or "")[:40],
+                        f"₹{r['gross_amount']:,.2f}",
+                        f"₹{r['gst_amount']:,.2f}",
+                        f"₹{r['total_amount']:,.2f}",
+                        str(r["payment_status"] or ""),
+                    ])
+                # Add totals row
+                rows.append([
+                    "TOTAL", "", "", "",
+                    f"₹{total_gross:,.2f}",
+                    f"₹{total_gst:,.2f}",
+                    f"₹{total_total:,.2f}", "",
+                ])
+
+                col_widths = [22*mm, 28*mm, 28*mm, 45*mm, 22*mm, 18*mm, 22*mm, 18*mm]
+                txn_table  = Table(rows, colWidths=col_widths, repeatRows=1)
+                txn_table.setStyle(TableStyle([
+                    ("BACKGROUND",    (0,0), (-1,0), NAVY),
+                    ("TEXTCOLOR",     (0,0), (-1,0), GOLD),
+                    ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+                    ("FONTNAME",      (0,-1), (-1,-1), "Helvetica-Bold"),
+                    ("BACKGROUND",    (0,-1), (-1,-1), colors.HexColor("#e8f5e9")),
+                    ("FONTSIZE",      (0,0), (-1,-1), 7.5),
+                    ("ALIGN",         (4,0), (-1,-1), "RIGHT"),
+                    ("ROWBACKGROUNDS",(0,1), (-1,-2), [colors.white, LIGHTGREY]),
+                    ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
+                    ("TOPPADDING",    (0,0), (-1,-1), 3),
+                    ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+                ]))
+                story.append(txn_table)
+                story.append(Spacer(1, 8*mm))
+                story.append(Paragraph(
+                    f"Generated on {date.today().strftime('%d %b %Y')} | Arthav Infra LLP",
+                    ParagraphStyle("footer", parent=styles["Normal"],
+                                   fontSize=7, textColor=colors.grey)
+                ))
+
+                doc.build(story)
+                pdf_bytes = buf.getvalue()
+
+                fname = (f"vendor_statement_{stmt_vendor.replace(' ','_')}_"
+                         f"{stmt_from.strftime('%Y%m%d')}_{stmt_to.strftime('%Y%m%d')}.pdf")
+                st.success(f"✅ Statement generated — {len(stmt_df)} transactions, "
+                           f"₹{total_total:,.2f} total.")
+                st.download_button("⬇ Download Statement PDF", data=pdf_bytes,
+                                   file_name=fname, mime="application/pdf",
+                                   use_container_width=True)
+
+
 
 
 def render_sidebar_log_gst(engine):
@@ -2913,29 +3511,118 @@ def render_credit_notes_tab(engine):
 
 
 def render_projects_tab(engine, df: pd.DataFrame):
-    st.markdown('<div class="section-header">Project Summary</div>', unsafe_allow_html=True)
-    projects = get_projects(engine)
-    if not df.empty and "project" in df.columns:
-        summary = (
-            df.groupby("project")
-            .agg(
-                Total_Expenses=("id", "count"),
-                Gross_Spend=("gross_amount", "sum"),
-                GST_Paid=("gst_amount", "sum"),
-                Total_With_GST=("total_amount", "sum"),
-                Pending=("payment_status", lambda x: (x == "Pending").sum()),
-            )
-            .reset_index()
-            .rename(columns={"project": "Project"})
-        )
-        summary["Gross_Spend"]     = summary["Gross_Spend"].map("₹{:,.2f}".format)
-        summary["GST_Paid"]        = summary["GST_Paid"].map("₹{:,.2f}".format)
-        summary["Total_With_GST"]  = summary["Total_With_GST"].map("₹{:,.2f}".format)
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-    else:
-        pdf = pd.DataFrame([{"ID": p.id, "Project": p.name} for p in projects])
-        st.dataframe(pdf, use_container_width=True, hide_index=True)
+    st.markdown('<div class="section-header">Project Summary & Budget Tracker</div>',
+                unsafe_allow_html=True)
+    projects   = get_projects(engine)
+    proj_names = [p.name for p in projects]
+
+    if df.empty or "project" not in df.columns:
         st.info("No expenses linked to projects yet.")
+        return
+
+    # ── Budget settings ───────────────────────────────────────────
+    st.markdown('<div class="section-header">Set Project Budgets</div>', unsafe_allow_html=True)
+    st.caption("Enter a budget for each project. Leave 0 for no budget.")
+
+    if "project_budgets" not in st.session_state:
+        st.session_state["project_budgets"] = {}
+
+    budget_cols = st.columns(min(len(proj_names), 3))
+    for i, pname in enumerate(proj_names):
+        with budget_cols[i % 3]:
+            current = st.session_state["project_budgets"].get(pname, 0.0)
+            new_budget = st.number_input(
+                pname, min_value=0.0, step=100000.0,
+                value=float(current), format="%.0f",
+                key=f"budget_{pname}"
+            )
+            st.session_state["project_budgets"][pname] = new_budget
+
+    st.markdown("---")
+
+    # ── Project spend summary with budget bars ────────────────────
+    st.markdown('<div class="section-header">Budget vs Actual Spend</div>',
+                unsafe_allow_html=True)
+
+    summary = (
+        df.groupby("project")
+        .agg(
+            count=("id", "count"),
+            gross=("gross_amount", "sum"),
+            gst=("gst_amount", "sum"),
+            total=("total_amount", "sum"),
+            pending=("payment_status", lambda x: (x == "Pending").sum()),
+        )
+        .reset_index()
+    )
+
+    for _, row in summary.iterrows():
+        pname   = row["project"]
+        gross   = row["gross"]
+        total   = row["total"]
+        budget  = st.session_state["project_budgets"].get(pname, 0)
+        pending = row["pending"]
+
+        with st.container():
+            h1, h2, h3, h4 = st.columns([3, 2, 2, 2])
+            with h1:
+                st.markdown(f"**{pname}**")
+            with h2:
+                st.metric("Gross Spend", f"₹{gross:,.0f}")
+            with h3:
+                st.metric("Total (with GST)", f"₹{total:,.0f}")
+            with h4:
+                st.metric("Pending", f"{int(pending)} expenses")
+
+            if budget > 0:
+                pct = min(gross / budget, 1.0)
+                color = "#e74c3c" if pct >= 1.0 else "#f39c12" if pct >= 0.8 else "#2ecc71"
+                remaining = budget - gross
+                st.markdown(f"""
+                <div style="margin: 4px 0 2px;">
+                    <div style="display:flex; justify-content:space-between;
+                                font-size:12px; color:#9ba4b5; margin-bottom:4px;">
+                        <span>₹{gross:,.0f} spent</span>
+                        <span>Budget: ₹{budget:,.0f}
+                        {'— <b style="color:#e74c3c">OVER BUDGET</b>'
+                         if remaining < 0
+                         else f'— ₹{remaining:,.0f} remaining'}</span>
+                    </div>
+                    <div style="background:#1e2a3a; border-radius:6px; height:12px;">
+                        <div style="background:{color}; width:{pct*100:.1f}%;
+                                    height:12px; border-radius:6px;
+                                    transition: width 0.3s;"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            st.markdown("---")
+
+    # ── Full summary table ────────────────────────────────────────
+    with st.expander("📋 Full project table"):
+        tbl = summary.copy()
+        tbl["Budget (₹)"] = tbl["project"].map(
+            lambda p: st.session_state["project_budgets"].get(p, 0)
+        )
+        tbl["Utilization"] = tbl.apply(
+            lambda r: f"{r['gross']/r['Budget (₹)']*100:.1f}%"
+            if r["Budget (₹)"] > 0 else "—", axis=1
+        )
+        tbl = tbl.rename(columns={
+            "project": "Project", "count": "Expenses",
+            "gross": "Gross (₹)", "gst": "GST (₹)",
+            "total": "Total (₹)", "pending": "Pending",
+        })
+        tbl["Gross (₹)"]  = tbl["Gross (₹)"].map("₹{:,.2f}".format)
+        tbl["GST (₹)"]    = tbl["GST (₹)"].map("₹{:,.2f}".format)
+        tbl["Total (₹)"]  = tbl["Total (₹)"].map("₹{:,.2f}".format)
+        tbl["Budget (₹)"] = tbl["Budget (₹)"].map(
+            lambda x: f"₹{x:,.0f}" if x > 0 else "—"
+        )
+        st.dataframe(tbl[["Project", "Expenses", "Gross (₹)", "GST (₹)",
+                           "Total (₹)", "Pending", "Budget (₹)", "Utilization"]],
+                     use_container_width=True, hide_index=True)
+
+
 
 
 # ─────────────────────────────────────────────
