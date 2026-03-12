@@ -41,7 +41,7 @@ st.set_page_config(
 DB_PATH        = "arthav_expenses.db"   # kept only for backup restore reads
 INVOICE_DIR    = Path("invoices")
 INVOICE_DIR.mkdir(exist_ok=True)
-GDRIVE_FOLDER  = "1PitNGfasNhTHGQqIyseHzTjhbnaJhUhg"
+GDRIVE_FOLDER  = "1knMSTuL6uBkbA2ZgksqNaTSJv6YAZ4Xu"
 
 
 def get_db_url() -> str:
