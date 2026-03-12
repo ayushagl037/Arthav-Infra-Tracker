@@ -1,6 +1,6 @@
 """
 Arthav Infra LLP — Expense & Invoice Tracker
-A modular Streamlit application with SQLite/SQLAlchemy backend.
+A modular Streamlit application with PostgreSQL/SQLAlchemy backend (Supabase).
 """
 
 import os
@@ -9,6 +9,8 @@ import json
 import base64
 import shutil
 import requests
+import zipfile
+import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 
@@ -36,10 +38,25 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 # 1. CONSTANTS & DIRECTORIES
 # ─────────────────────────────────────────────
-DB_PATH        = "arthav_expenses.db"
+DB_PATH        = "arthav_expenses.db"   # kept only for backup restore reads
 INVOICE_DIR    = Path("invoices")
 INVOICE_DIR.mkdir(exist_ok=True)
 GDRIVE_FOLDER  = "1PitNGfasNhTHGQqIyseHzTjhbnaJhUhg"
+
+
+def get_db_url() -> str:
+    """
+    Returns the PostgreSQL connection URL from Streamlit secrets.
+    Falls back to SQLite only if secret is missing (local dev).
+    """
+    try:
+        url = st.secrets["supabase"]["db_url"]
+        # SQLAlchemy requires 'postgresql://' not 'postgres://'
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        return url
+    except Exception:
+        return f"sqlite:///{DB_PATH}"
 
 DEFAULT_CATEGORIES = ["Operational", "Utilities", "Raw Materials", "Marketing",
                       "Labour", "Legal & Professional", "Travel", "Miscellaneous",
@@ -134,9 +151,23 @@ class Expense(Base):
 
 @st.cache_resource
 def get_engine():
-    engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+    db_url = get_db_url()
+    is_pg  = db_url.startswith("postgresql")
+
+    if is_pg:
+        engine = create_engine(
+            db_url,
+            echo=False,
+            pool_pre_ping=True,        # detect stale connections
+            pool_recycle=300,          # recycle every 5 min
+            connect_args={"sslmode": "require"},
+        )
+    else:
+        engine = create_engine(db_url, echo=False)
+
     Base.metadata.create_all(engine)
-    _migrate_add_drive_file_id(engine)
+    if not is_pg:
+        _migrate_add_drive_file_id_sqlite(engine)
     _seed_categories(engine)
     _seed_projects(engine)
     _seed_receipt_counter(engine)
@@ -264,8 +295,8 @@ def get_scanned_expense(engine, expense_id: int):
         }
 
 
-def _migrate_add_drive_file_id(engine):
-    """Safely add drive_file_id column if it doesn't exist (for existing DBs)."""
+def _migrate_add_drive_file_id_sqlite(engine):
+    """Safely add drive_file_id column for SQLite local dev fallback only."""
     with engine.connect() as conn:
         cols = [row[1] for row in conn.execute(text("PRAGMA table_info(expenses)")).fetchall()]
         if "drive_file_id" not in cols:
@@ -1230,18 +1261,15 @@ def render_sidebar_export(df: pd.DataFrame):
     # ── Full backup ZIP ───────────────────────────────────────────
     st.sidebar.markdown("---")
     st.sidebar.markdown("## 🗄️ Full Backup")
-    st.sidebar.caption("Downloads your entire database + all PDFs as a ZIP file.")
+    st.sidebar.caption("Downloads all PDFs + a CSV of your expenses as a ZIP file.")
     if st.sidebar.button("⬇ Download Full Backup ZIP", use_container_width=True):
         zip_buf = io.BytesIO()
-        with __import__("zipfile").ZipFile(zip_buf, "w", __import__("zipfile").ZIP_DEFLATED) as zf:
-            # Add database
-            if Path(DB_PATH).exists():
-                zf.write(DB_PATH, "arthav_expenses.db")
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             # Add all PDFs from invoices folder
             if INVOICE_DIR.exists():
                 for pdf_file in INVOICE_DIR.glob("*.pdf"):
                     zf.write(pdf_file, f"invoices/{pdf_file.name}")
-            # Add CSV export
+            # Add CSV export of current data
             zf.writestr("arthav_expenses.csv", df.to_csv(index=False))
         zip_buf.seek(0)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2352,6 +2380,200 @@ def render_projects_tab(engine, df: pd.DataFrame):
 # 7. MAIN
 # ─────────────────────────────────────────────
 
+def render_restore_tab(engine):
+    """Restore data from a previously downloaded backup ZIP (SQLite .db file inside)."""
+    st.markdown('<div class="section-header">Restore from Backup</div>',
+                unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#0f2040; border:1px solid #1e3050; border-radius:10px;
+                padding:14px 20px; margin-bottom:20px; border-left:3px solid #c9a84c;">
+        <strong style="color:#c9a84c;">One-time data restore</strong>
+        <span style="color:#c9c6be; font-size:14px;"> — Upload your
+        <code>arthav_full_backup_*.zip</code> file to restore all expenses, vendors,
+        categories, and projects into the new Supabase database.
+        This is safe to run multiple times — duplicate records are skipped automatically.</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_zip = st.file_uploader("Upload your backup ZIP", type=["zip"],
+                                     key="restore_zip_uploader")
+    if uploaded_zip is None:
+        st.info("👆 Upload your backup ZIP file to begin.")
+        return
+
+    if st.button("🔄 Restore Data from ZIP", use_container_width=False):
+        with st.spinner("Restoring data — please wait..."):
+            try:
+                zip_bytes = uploaded_zip.read()
+                zf        = zipfile.ZipFile(io.BytesIO(zip_bytes))
+                names     = zf.namelist()
+
+                # Find the SQLite DB inside the ZIP
+                db_files = [n for n in names if n.endswith(".db")]
+                if not db_files:
+                    st.error("No .db file found in the ZIP. Make sure you're uploading the correct backup.")
+                    return
+
+                # Extract SQLite DB to a temp path
+                tmp_db = Path("/tmp/restore_arthav.db")
+                tmp_db.write_bytes(zf.read(db_files[0]))
+
+                # Read from SQLite
+                src = sqlite3.connect(str(tmp_db))
+                src.row_factory = sqlite3.Row
+
+                counts = {"vendors": 0, "categories": 0, "projects": 0,
+                          "expenses": 0, "gst": 0}
+
+                with Session(engine) as s:
+
+                    # ── Vendors ──────────────────────────────────
+                    try:
+                        rows = src.execute("SELECT * FROM vendors").fetchall()
+                        for r in rows:
+                            exists = s.query(Vendor).filter_by(name=r["name"]).first()
+                            if not exists:
+                                s.add(Vendor(
+                                    name=r["name"],
+                                    gst_number=r["gst_number"],
+                                    contact_person=r["contact_person"],
+                                ))
+                                counts["vendors"] += 1
+                        s.flush()
+                    except Exception as e:
+                        st.warning(f"Vendors: {e}")
+
+                    # ── Categories ───────────────────────────────
+                    try:
+                        rows = src.execute("SELECT * FROM categories").fetchall()
+                        for r in rows:
+                            exists = s.query(Category).filter_by(name=r["name"]).first()
+                            if not exists:
+                                s.add(Category(name=r["name"]))
+                                counts["categories"] += 1
+                        s.flush()
+                    except Exception as e:
+                        st.warning(f"Categories: {e}")
+
+                    # ── Projects ─────────────────────────────────
+                    try:
+                        rows = src.execute("SELECT * FROM projects").fetchall()
+                        for r in rows:
+                            exists = s.query(Project).filter_by(name=r["name"]).first()
+                            if not exists:
+                                s.add(Project(name=r["name"]))
+                                counts["projects"] += 1
+                        s.flush()
+                    except Exception as e:
+                        st.warning(f"Projects: {e}")
+
+                    # Build lookup maps after inserts
+                    vendor_map   = {v.name: v.id for v in s.query(Vendor).all()}
+                    category_map = {c.name: c.id for c in s.query(Category).all()}
+                    project_map  = {p.name: p.id for p in s.query(Project).all()}
+
+                    # ── Expenses ─────────────────────────────────
+                    try:
+                        rows = src.execute("""
+                            SELECT e.*,
+                                   v.name AS vendor_name,
+                                   c.name AS category_name,
+                                   p.name AS project_name
+                            FROM expenses e
+                            LEFT JOIN vendors    v ON v.id = e.vendor_id
+                            LEFT JOIN categories c ON c.id = e.category_id
+                            LEFT JOIN projects   p ON p.id = e.project_id
+                        """).fetchall()
+                        for r in rows:
+                            # Skip if already exists (match on date + description + amount)
+                            dup = s.query(Expense).filter_by(
+                                date=datetime.strptime(r["date"], "%Y-%m-%d").date()
+                                     if isinstance(r["date"], str) else r["date"],
+                                gross_amount=r["gross_amount"],
+                                description=r["description"],
+                            ).first()
+                            if dup:
+                                continue
+                            exp_date = r["date"]
+                            if isinstance(exp_date, str):
+                                exp_date = datetime.strptime(exp_date, "%Y-%m-%d").date()
+                            s.add(Expense(
+                                date=exp_date,
+                                vendor_id=vendor_map.get(r["vendor_name"]),
+                                category_id=category_map.get(r["category_name"]),
+                                project_id=project_map.get(r["project_name"]),
+                                description=r["description"],
+                                gross_amount=r["gross_amount"],
+                                gst_amount=r["gst_amount"] or 0,
+                                payment_status=r["payment_status"],
+                                invoice_path=r["invoice_path"],
+                                drive_file_id=r["drive_file_id"]
+                                    if "drive_file_id" in r.keys() else None,
+                            ))
+                            counts["expenses"] += 1
+                        s.flush()
+                    except Exception as e:
+                        st.warning(f"Expenses: {e}")
+
+                    # ── GST Transactions ─────────────────────────
+                    try:
+                        rows = src.execute("""
+                            SELECT g.*, p.name AS project_name
+                            FROM gst_transactions g
+                            LEFT JOIN projects p ON p.id = g.project_id
+                        """).fetchall()
+                        for r in rows:
+                            txn_date = r["date"]
+                            if isinstance(txn_date, str):
+                                txn_date = datetime.strptime(txn_date, "%Y-%m-%d").date()
+                            dup = s.query(GstTransaction).filter_by(
+                                date=txn_date,
+                                base_value=r["base_value"],
+                                description=r["description"],
+                            ).first()
+                            if dup:
+                                continue
+                            s.add(GstTransaction(
+                                date=txn_date,
+                                project_id=project_map.get(r["project_name"]),
+                                transaction_type=r["transaction_type"],
+                                base_value=r["base_value"],
+                                taxable_value=r["taxable_value"],
+                                gst_rate=r["gst_rate"],
+                                output_gst=r["output_gst"],
+                                description=r["description"],
+                            ))
+                            counts["gst"] += 1
+                        s.flush()
+                    except Exception as e:
+                        st.warning(f"GST transactions: {e}")
+
+                    s.commit()
+
+                src.close()
+                tmp_db.unlink(missing_ok=True)
+
+                st.success("✅ Restore complete!")
+                st.markdown(f"""
+                <div style="background:#0f2040; border:1px solid #1e3050;
+                            border-radius:8px; padding:14px 20px; margin-top:10px;">
+                    <div style="color:#c9a84c; font-weight:700; margin-bottom:8px;">
+                        Records restored:</div>
+                    <div style="color:#e8e6df; font-size:14px; line-height:2;">
+                        🏢 Vendors: <b>{counts['vendors']}</b><br>
+                        🏷️ Categories: <b>{counts['categories']}</b><br>
+                        🏗️ Projects: <b>{counts['projects']}</b><br>
+                        💳 Expenses: <b>{counts['expenses']}</b><br>
+                        🧾 GST Transactions: <b>{counts['gst']}</b>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.balloons()
+
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+
+
 def main():
     inject_css()
     engine = get_engine()
@@ -2368,9 +2590,10 @@ def main():
     render_header()
     render_summary_cards(df)
 
-    tab_ledger, tab_scanner, tab_receipt, tab_analytics, tab_gst, tab_vendors, tab_projects = st.tabs([
+    tab_ledger, tab_scanner, tab_receipt, tab_analytics, tab_gst, tab_vendors, tab_projects, tab_restore = st.tabs([
         "📒  Ledger", "🤖  AI Scanner", "🖨️  Receipt Generator",
-        "📊  Analytics", "🧾  Tax Dashboard", "🏢  Vendors", "🏗️  Projects"
+        "📊  Analytics", "🧾  Tax Dashboard", "🏢  Vendors", "🏗️  Projects",
+        "♻️  Restore"
     ])
     with tab_ledger:
         render_accounting_table(df, engine)
@@ -2386,6 +2609,8 @@ def main():
         render_vendors_tab(engine)
     with tab_projects:
         render_projects_tab(engine, df)
+    with tab_restore:
+        render_restore_tab(engine)
 
 
 if __name__ == "__main__":
