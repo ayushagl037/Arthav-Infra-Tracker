@@ -11,7 +11,7 @@ import shutil
 import requests
 import zipfile
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -21,7 +21,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sqlalchemy import (
     create_engine, Column, Integer, Text, Float, Date,
-    ForeignKey, CheckConstraint, event, text
+    ForeignKey, CheckConstraint, event, text, func
 )
 from sqlalchemy.orm import declarative_base, Session, relationship
 
@@ -168,6 +168,27 @@ class Expense(Base):
     vendor         = relationship("Vendor",   back_populates="expenses")
     category       = relationship("Category", back_populates="expenses")
     project        = relationship("Project",  back_populates="expenses")
+
+
+class CreditNote(Base):
+    """Tracks credit notes received from vendors against original expenses."""
+    __tablename__ = "credit_notes"
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    date            = Column(Date, nullable=False)
+    expense_id      = Column(Integer, ForeignKey("expenses.id"), nullable=True)
+    vendor_id       = Column(Integer, ForeignKey("vendors.id"))
+    project_id      = Column(Integer, ForeignKey("projects.id"))
+    category_id     = Column(Integer, ForeignKey("categories.id"))
+    credit_amount   = Column(Float, nullable=False)   # gross credit
+    gst_credit      = Column(Float, default=0)        # GST reversed
+    description     = Column(Text)
+    ref_invoice_no  = Column(Text)                    # vendor's original invoice number
+    invoice_path    = Column(Text)                    # optional uploaded PDF
+    drive_file_id   = Column(Text)
+    vendor          = relationship("Vendor")
+    project         = relationship("Project")
+    category        = relationship("Category")
+    expense         = relationship("Expense")
 
 
 @st.cache_resource
@@ -363,7 +384,8 @@ def get_expenses_df(engine) -> pd.DataFrame:
             e.gst_amount,
             (e.gross_amount + e.gst_amount) AS total_amount,
             e.payment_status,
-            e.invoice_path
+            e.invoice_path,
+            e.drive_file_id
         FROM expenses e
         LEFT JOIN vendors    v ON e.vendor_id   = v.id
         LEFT JOIN categories c ON e.category_id = c.id
@@ -372,6 +394,28 @@ def get_expenses_df(engine) -> pd.DataFrame:
     """
     with engine.connect() as conn:
         return pd.read_sql(text(query), conn)
+
+
+def get_net_spend_df(engine) -> pd.DataFrame:
+    """Returns expenses with credit notes netted off — used in Analytics."""
+    exp_df = get_expenses_df(engine)
+    cn_df  = get_credit_notes_df(engine)
+    if exp_df.empty:
+        return exp_df
+    if cn_df.empty:
+        return exp_df
+    # Aggregate credits per project/vendor/category
+    cn_agg = cn_df.groupby(["project", "vendor", "category"]).agg(
+        total_credit=("credit_amount", "sum"),
+        gst_credit=("gst_credit", "sum"),
+    ).reset_index()
+    merged = exp_df.merge(cn_agg, on=["project", "vendor", "category"], how="left")
+    merged["total_credit"] = merged["total_credit"].fillna(0)
+    merged["gst_credit"]   = merged["gst_credit"].fillna(0)
+    merged["gross_amount"] = merged["gross_amount"] - merged["total_credit"]
+    merged["gst_amount"]   = merged["gst_amount"]   - merged["gst_credit"]
+    merged["total_amount"] = merged["gross_amount"] + merged["gst_amount"]
+    return merged.drop(columns=["total_credit", "gst_credit"])
 
 
 def update_payment_status(engine, expense_id: int, new_status: str):
@@ -391,8 +435,192 @@ def delete_expense(engine, expense_id: int):
 
 
 # ─────────────────────────────────────────────
-# 3b. GST CALCULATION ENGINE
+# 3c. CREDIT NOTE DB FUNCTIONS
 # ─────────────────────────────────────────────
+
+def add_credit_note(engine, date, expense_id, vendor_id, project_id, category_id,
+                    credit_amount, gst_credit, description, ref_invoice_no,
+                    invoice_path=None, drive_file_id=None):
+    with Session(engine) as s:
+        cn = CreditNote(
+            date=date, expense_id=expense_id, vendor_id=vendor_id,
+            project_id=project_id, category_id=category_id,
+            credit_amount=credit_amount, gst_credit=gst_credit,
+            description=description, ref_invoice_no=ref_invoice_no,
+            invoice_path=invoice_path, drive_file_id=drive_file_id,
+        )
+        s.add(cn)
+        s.commit()
+
+
+def get_credit_notes_df(engine) -> pd.DataFrame:
+    query = """
+        SELECT
+            cn.id,
+            cn.date,
+            p.name          AS project,
+            v.name          AS vendor,
+            c.name          AS category,
+            cn.description,
+            cn.credit_amount,
+            cn.gst_credit,
+            (cn.credit_amount + cn.gst_credit) AS total_credit,
+            cn.ref_invoice_no,
+            cn.expense_id,
+            cn.invoice_path,
+            cn.drive_file_id
+        FROM credit_notes cn
+        LEFT JOIN vendors    v ON cn.vendor_id   = v.id
+        LEFT JOIN categories c ON cn.category_id = c.id
+        LEFT JOIN projects   p ON cn.project_id  = p.id
+        ORDER BY cn.date DESC
+    """
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(text(query), conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def delete_credit_note(engine, cn_id: int):
+    with Session(engine) as s:
+        cn = s.get(CreditNote, cn_id)
+        if cn:
+            s.delete(cn)
+            s.commit()
+
+
+def search_expenses_for_credit(engine, vendor_id=None, invoice_no=None,
+                                date_from=None, date_to=None, amount=None):
+    """Search original expenses to link a credit note against."""
+    with Session(engine) as s:
+        q = s.query(Expense)
+        if vendor_id:
+            q = q.filter(Expense.vendor_id == vendor_id)
+        if invoice_no:
+            q = q.filter(Expense.invoice_path.ilike(f"%{invoice_no}%"))
+        if date_from:
+            q = q.filter(Expense.date >= date_from)
+        if date_to:
+            q = q.filter(Expense.date <= date_to)
+        if amount:
+            q = q.filter(Expense.gross_amount.between(amount * 0.8, amount * 1.2))
+        results = q.order_by(Expense.date.desc()).limit(20).all()
+        return [{"id": e.id, "date": e.date, "description": e.description,
+                 "gross_amount": e.gross_amount, "vendor_id": e.vendor_id,
+                 "invoice_path": e.invoice_path} for e in results]
+
+
+
+
+
+
+
+# ─────────────────────────────────────────────
+# 3d. VALIDATION ENGINE
+# ─────────────────────────────────────────────
+
+VALID_GST_RATES = [0, 5, 18]   # per latest GST law for most B2B real estate expenses
+
+def validate_gst_amount(gross: float, gst: float) -> list:
+    """Check GST amount against valid rates and sanity cap."""
+    warnings = []
+    if gross <= 0:
+        return warnings
+    effective_rate = (gst / gross) * 100
+    if effective_rate > 28:
+        warnings.append(
+            f"⚠️ GST sanity check: ₹{gst:,.2f} is {effective_rate:.1f}% of gross — "
+            f"exceeds 28% maximum. Did you accidentally swap gross and GST?"
+        )
+        return warnings
+    if gst > 0:
+        closest = min(VALID_GST_RATES, key=lambda r: abs(effective_rate - r))
+        if abs(effective_rate - closest) > 0.5:
+            valid_str = ", ".join(f"{r}%" for r in VALID_GST_RATES if r > 0)
+            warnings.append(
+                f"⚠️ GST rate check: effective rate is {effective_rate:.1f}% — "
+                f"expected one of {valid_str} (or 0%). "
+                f"Closest valid rate would be {closest}% = ₹{gross * closest / 100:,.2f}."
+            )
+    return warnings
+
+
+def validate_credit_cap(engine, expense_id: int, credit_amount: float,
+                         gst_credit: float) -> list:
+    """Ensure credit doesn't exceed the original expense amount."""
+    warnings = []
+    if not expense_id or expense_id <= 0:
+        return warnings
+    with Session(engine) as s:
+        exp = s.get(Expense, expense_id)
+        if exp:
+            if credit_amount > exp.gross_amount:
+                warnings.append(
+                    f"⚠️ Credit cap: ₹{credit_amount:,.2f} exceeds the original expense "
+                    f"gross of ₹{exp.gross_amount:,.2f} (Expense #{expense_id}). "
+                    f"Maximum credit allowed is ₹{exp.gross_amount:,.2f}."
+                )
+            if gst_credit > exp.gst_amount:
+                warnings.append(
+                    f"⚠️ GST credit cap: ₹{gst_credit:,.2f} exceeds the original GST "
+                    f"of ₹{exp.gst_amount:,.2f} (Expense #{expense_id})."
+                )
+    return warnings
+
+
+def validate_vendor_threshold(engine, vendor_id: int, new_amount: float,
+                               threshold: float = 500000) -> list:
+    """Warn if vendor's monthly spend crosses threshold after this expense."""
+    warnings = []
+    if not vendor_id:
+        return warnings
+    today = date.today()
+    month_start = today.replace(day=1)
+    with Session(engine) as s:
+        existing = s.query(func.sum(Expense.gross_amount)).filter(
+            Expense.vendor_id == vendor_id,
+            Expense.date >= month_start,
+        ).scalar() or 0
+        total = existing + new_amount
+        if total >= threshold:
+            v = s.get(Vendor, vendor_id)
+            vname = v.name if v else f"Vendor #{vendor_id}"
+            warnings.append(
+                f"⚠️ Vendor threshold: {vname}'s total spend this month will be "
+                f"₹{total:,.2f} — exceeds the ₹{threshold:,.0f} monthly alert threshold."
+            )
+    return warnings
+
+
+def validate_missing_invoice(gross: float, pdf_attached: bool) -> list:
+    """Warn if expense above ₹10,000 has no PDF attached."""
+    if gross >= 10000 and not pdf_attached:
+        return [
+            f"⚠️ Missing invoice: expenses ≥ ₹10,000 should have a PDF attached "
+            f"for audit purposes. This expense is ₹{gross:,.2f}."
+        ]
+    return []
+
+
+def get_unlinked_credit_notes(engine) -> pd.DataFrame:
+    """Return credit notes older than 7 days with no linked expense."""
+    cn_df = get_credit_notes_df(engine)
+    if cn_df.empty:
+        return pd.DataFrame()
+    cutoff = date.today() - timedelta(days=7)
+    unlinked = cn_df[
+        (cn_df["expense_id"].isna() | (cn_df["expense_id"] == 0)) &
+        (pd.to_datetime(cn_df["date"]).dt.date <= cutoff)
+    ]
+    return unlinked
+
+
+def show_validation_warnings(warnings: list):
+    """Render a list of validation warning strings."""
+    for w in warnings:
+        st.warning(w)
+
 
 def calculate_output_gst(transaction_type: str, base_value: float) -> dict:
     """
@@ -1297,6 +1525,14 @@ def render_sidebar_add_expense(engine):
                 vendor_id   = vendor_map.get(vendor_name)
                 category_id = category_map.get(category)
                 project_id  = project_map.get(project_name)
+
+                # ── Run validations ───────────────────────────────
+                all_warnings = []
+                all_warnings += validate_gst_amount(gross, gst)
+                all_warnings += validate_vendor_threshold(engine, vendor_id, gross)
+                all_warnings += validate_missing_invoice(gross, pdf_file is not None)
+                show_validation_warnings(all_warnings)
+
                 inv_path    = save_invoice(pdf_file, exp_date)
                 drive_fid, _ = upload_to_drive(inv_path) if inv_path else (None, None)
                 add_expense(engine, exp_date, vendor_id, category_id, project_id,
@@ -1392,21 +1628,56 @@ def render_accounting_table(df: pd.DataFrame, engine):
         st.info("No expenses recorded yet. Use the sidebar to add your first entry.")
         return
 
+    # ── Merge credit notes as negative rows ──────────────────────
+    cn_df = get_credit_notes_df(engine)
+    if not cn_df.empty:
+        cn_rows = cn_df.rename(columns={
+            "credit_amount": "gross_amount",
+            "gst_credit":    "gst_amount",
+            "total_credit":  "total_amount",
+            "invoice_path":  "invoice_path",
+        }).copy()
+        cn_rows["gross_amount"] = -cn_rows["gross_amount"]
+        cn_rows["gst_amount"]   = -cn_rows["gst_amount"]
+        cn_rows["total_amount"] = -cn_rows["total_amount"]
+        cn_rows["payment_status"] = "Credit Note"
+        cn_rows["id"] = cn_rows["id"].apply(lambda x: f"CN-{x}")
+        cn_rows["description"] = cn_rows["description"].apply(
+            lambda x: f"[CREDIT] {x}" if x else "[CREDIT NOTE]"
+        )
+        # Align columns
+        for col in ["id", "date", "project", "vendor", "category", "description",
+                    "gross_amount", "gst_amount", "total_amount",
+                    "payment_status", "invoice_path"]:
+            if col not in cn_rows.columns:
+                cn_rows[col] = None
+        combined = pd.concat([
+            df[["id", "date", "project", "vendor", "category", "description",
+                "gross_amount", "gst_amount", "total_amount",
+                "payment_status", "invoice_path"]],
+            cn_rows[["id", "date", "project", "vendor", "category", "description",
+                     "gross_amount", "gst_amount", "total_amount",
+                     "payment_status", "invoice_path"]],
+        ], ignore_index=True)
+    else:
+        combined = df.copy()
+
     # ── Filters row ──────────────────────────────────────────────
     fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 2])
     with fc1:
-        status_filter = st.selectbox("Filter by Status", ["All", "Paid", "Pending"])
+        status_filter = st.selectbox("Filter by Status",
+                                      ["All", "Paid", "Pending", "Credit Note"])
     with fc2:
-        proj_options  = ["All"] + sorted(df["project"].dropna().unique().tolist())
+        proj_options  = ["All"] + sorted(combined["project"].dropna().unique().tolist())
         proj_filter   = st.selectbox("Filter by Project", proj_options)
     with fc3:
-        cat_options = ["All"] + sorted(df["category"].dropna().unique().tolist())
+        cat_options = ["All"] + sorted(combined["category"].dropna().unique().tolist())
         cat_filter  = st.selectbox("Filter by Category", cat_options)
     with fc4:
-        vendor_options = ["All"] + sorted(df["vendor"].dropna().unique().tolist())
+        vendor_options = ["All"] + sorted(combined["vendor"].dropna().unique().tolist())
         vendor_filter  = st.selectbox("Filter by Vendor", vendor_options)
 
-    view = df.copy()
+    view = combined.copy()
     if status_filter != "All":
         view = view[view["payment_status"] == status_filter]
     if proj_filter != "All":
@@ -1452,33 +1723,40 @@ def render_accounting_table(df: pd.DataFrame, engine):
             st.rerun()
 
 
-def render_analytics_tab(df: pd.DataFrame):
+def render_analytics_tab(engine, df: pd.DataFrame):
     st.markdown('<div class="section-header">Spend Analytics</div>', unsafe_allow_html=True)
     if df.empty:
         st.info("Add some expenses to see analytics.")
         return
 
+    # Use net spend (credits subtracted)
+    net_df = get_net_spend_df(engine)
+    cn_df  = get_credit_notes_df(engine)
+    if not cn_df.empty:
+        st.info(f"📉 Analytics reflect net spend after subtracting "
+                f"₹{cn_df['total_credit'].sum():,.2f} in credit notes.")
+
     ac1, ac2 = st.columns(2)
     with ac1:
-        st.markdown("**Spend by Project**")
-        proj_spend = df.groupby("project")["gross_amount"].sum().sort_values(ascending=False)
+        st.markdown("**Net Spend by Project**")
+        proj_spend = net_df.groupby("project")["gross_amount"].sum().sort_values(ascending=False)
         st.bar_chart(proj_spend)
 
     with ac2:
-        st.markdown("**Spend by Category**")
-        cat_spend = df.groupby("category")["gross_amount"].sum().sort_values(ascending=False)
+        st.markdown("**Net Spend by Category**")
+        cat_spend = net_df.groupby("category")["gross_amount"].sum().sort_values(ascending=False)
         st.bar_chart(cat_spend)
 
     ac3, ac4 = st.columns(2)
     with ac3:
-        st.markdown("**Spend by Vendor**")
-        vendor_spend = df.groupby("vendor")["gross_amount"].sum().sort_values(ascending=False).head(10)
+        st.markdown("**Net Spend by Vendor**")
+        vendor_spend = net_df.groupby("vendor")["gross_amount"].sum().sort_values(ascending=False).head(10)
         st.bar_chart(vendor_spend)
 
     with ac4:
         st.markdown("**Monthly Trend**")
-        df["month"] = pd.to_datetime(df["date"]).dt.to_period("M").astype(str)
-        monthly = df.groupby("month")[["gross_amount","gst_amount"]].sum()
+        net_df["month"] = pd.to_datetime(net_df["date"]).dt.to_period("M").astype(str)
+        monthly = net_df.groupby("month")[["gross_amount","gst_amount"]].sum()
         st.bar_chart(monthly)
 
 
@@ -1942,6 +2220,13 @@ def render_invoice_scanner_tab(engine):
                 if gross <= 0:
                     st.error("Gross amount must be greater than 0.")
                 else:
+                    # ── Run validations ───────────────────────────
+                    all_warnings = []
+                    all_warnings += validate_gst_amount(gross, gst)
+                    all_warnings += validate_vendor_threshold(engine, final_vendor_id, gross)
+                    all_warnings += validate_missing_invoice(gross, True)  # PDF always present in scanner
+                    show_validation_warnings(all_warnings)
+
                     inv_path = save_invoice_bytes(
                         st.session_state["ai_pdf_bytes"],
                         st.session_state["ai_pdf_name"],
@@ -2445,6 +2730,188 @@ def render_receipt_generator_tab(engine):
                 st.rerun()
 
 
+def render_credit_notes_tab(engine):
+    st.markdown('<div class="section-header">Credit Notes</div>', unsafe_allow_html=True)
+    st.caption("Log credit notes received from vendors. Link them to original expenses to keep your books accurate.")
+
+    vendors    = get_vendors(engine)
+    categories = get_categories(engine)
+    projects   = get_projects(engine)
+    vendor_names   = [v.name for v in vendors]
+    category_names = [c.name for c in categories]
+    project_names  = [p.name for p in projects]
+    vendor_map     = {v.name: v.id for v in vendors}
+    category_map   = {c.name: c.id for c in categories}
+    project_map    = {p.name: p.id for p in projects}
+
+    # ── Add Credit Note ───────────────────────────────────────────
+    st.markdown('<div class="section-header">Log a New Credit Note</div>', unsafe_allow_html=True)
+
+    with st.form("credit_note_form", clear_on_submit=True):
+        cn1, cn2 = st.columns(2)
+        with cn1:
+            cn_date    = st.date_input("Credit Note Date", value=date.today(), key="cn_date")
+            cn_vendor  = st.selectbox("Vendor", vendor_names, key="cn_vendor")
+            cn_project = st.selectbox("Project", project_names, key="cn_project")
+            cn_cat     = st.selectbox("Category", category_names, key="cn_cat")
+        with cn2:
+            cn_credit  = st.number_input("Credit Amount (₹)", min_value=0.0, step=100.0, key="cn_credit")
+            cn_gst     = st.number_input("GST Reversed (₹)", min_value=0.0, step=10.0, key="cn_gst")
+            cn_ref     = st.text_input("Original Invoice No. (optional)", key="cn_ref",
+                                        placeholder="e.g. INV-2026-001")
+            cn_desc    = st.text_input("Description", key="cn_desc",
+                                        placeholder="e.g. Material returned — partial refund")
+
+        st.markdown("**Link to Original Expense (optional)**")
+        st.caption("Search for the original expense to link this credit note against.")
+        ls1, ls2, ls3 = st.columns(3)
+        with ls1:
+            cn_search_inv = st.text_input("Search by Invoice No.", key="cn_search_inv")
+        with ls2:
+            cn_search_amt = st.number_input("Approx. Original Amount (₹)",
+                                             min_value=0.0, step=100.0, key="cn_search_amt")
+        with ls3:
+            cn_expense_id = st.number_input("Or enter Expense ID directly",
+                                             min_value=0, step=1, key="cn_expense_id",
+                                             help="Get the ID from the Ledger tab")
+
+        cn_pdf = st.file_uploader("Upload Credit Note PDF (optional)", type=["pdf"], key="cn_pdf")
+
+        submit_cn = st.form_submit_button("💾 Save Credit Note", use_container_width=True)
+
+    if submit_cn:
+        if cn_credit <= 0:
+            st.error("Credit amount must be greater than 0.")
+        elif not cn_vendor:
+            st.error("Please select a vendor.")
+        else:
+            linked_expense_id = int(cn_expense_id) if cn_expense_id > 0 else None
+
+            # ── Run validations ───────────────────────────────────
+            all_warnings = []
+            all_warnings += validate_credit_cap(engine, linked_expense_id, cn_credit, cn_gst)
+            all_warnings += validate_gst_amount(cn_credit, cn_gst)
+            show_validation_warnings(all_warnings)
+
+            # Block save if credit cap exceeded
+            cap_errors = validate_credit_cap(engine, linked_expense_id, cn_credit, cn_gst)
+            if cap_errors:
+                st.error("❌ Cannot save: credit amount exceeds original expense. Please correct the amounts above.")
+            else:
+                inv_path  = None
+                drive_fid = None
+                if cn_pdf is not None:
+                    pdf_bytes = cn_pdf.read()
+                    inv_path  = save_invoice_bytes(pdf_bytes, cn_pdf.name, cn_date)
+                    drive_fid, _ = upload_to_drive(inv_path, pdf_bytes)
+
+                add_credit_note(
+                    engine      = engine,
+                    date        = cn_date,
+                    expense_id  = linked_expense_id,
+                    vendor_id   = vendor_map.get(cn_vendor),
+                    project_id  = project_map.get(cn_project),
+                    category_id = category_map.get(cn_cat),
+                    credit_amount  = cn_credit,
+                    gst_credit     = cn_gst,
+                    description    = cn_desc.strip(),
+                    ref_invoice_no = cn_ref.strip(),
+                    invoice_path   = str(inv_path) if inv_path else None,
+                    drive_file_id  = drive_fid,
+                )
+                st.success("✅ Credit note saved successfully!")
+                st.rerun()
+
+    # ── Search original expenses to find ID ──────────────────────
+    st.markdown('<div class="section-header">Find Original Expense</div>', unsafe_allow_html=True)
+    st.caption("Use this to look up the Expense ID before logging the credit note above.")
+
+    fs1, fs2, fs3, fs4 = st.columns(4)
+    with fs1:
+        find_vendor = st.selectbox("Vendor", ["All"] + vendor_names, key="find_vendor")
+    with fs2:
+        find_inv = st.text_input("Invoice No. contains", key="find_inv")
+    with fs3:
+        find_amt = st.number_input("Approx. Amount (₹)", min_value=0.0, step=100.0, key="find_amt")
+    with fs4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        find_clicked = st.button("🔍 Search Expenses", key="find_exp_btn")
+
+    if find_clicked:
+        results = search_expenses_for_credit(
+            engine,
+            vendor_id  = vendor_map.get(find_vendor) if find_vendor != "All" else None,
+            invoice_no = find_inv.strip() if find_inv.strip() else None,
+            amount     = find_amt if find_amt > 0 else None,
+        )
+        if results:
+            res_df = pd.DataFrame(results)
+            st.dataframe(
+                res_df[["id", "date", "description", "gross_amount", "invoice_path"]]
+                .rename(columns={"id": "ID", "date": "Date", "description": "Description",
+                                  "gross_amount": "Gross (₹)", "invoice_path": "Invoice"}),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption("Copy the ID from above and enter it in the 'Or enter Expense ID directly' field when logging the credit note.")
+        else:
+            st.info("No matching expenses found. Try different search criteria.")
+
+    # ── Credit Notes Ledger ───────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">All Credit Notes</div>', unsafe_allow_html=True)
+
+    # ── Unlinked credit notes alert ───────────────────────────────
+    unlinked = get_unlinked_credit_notes(engine)
+    if not unlinked.empty:
+        st.warning(
+            f"⚠️ **{len(unlinked)} unlinked credit note(s)** older than 7 days have no "
+            f"original expense linked. Consider linking them for accurate books. "
+            f"IDs: {', '.join('#' + str(i) for i in unlinked['id'].tolist())}"
+        )
+
+    cn_df = get_credit_notes_df(engine)
+    if cn_df.empty:
+        st.info("No credit notes logged yet.")
+    else:
+        display_cn = cn_df.copy()
+        display_cn = display_cn.sort_values("date", ascending=False)
+        st.dataframe(
+            display_cn[["id", "date", "project", "vendor", "category", "description",
+                         "credit_amount", "gst_credit", "total_credit",
+                         "ref_invoice_no", "expense_id", "invoice_path"]]
+            .rename(columns={
+                "id": "ID", "date": "Date", "project": "Project", "vendor": "Vendor",
+                "category": "Category", "description": "Description",
+                "credit_amount": "Credit (₹)", "gst_credit": "GST Reversed (₹)",
+                "total_credit": "Total Credit (₹)", "ref_invoice_no": "Ref Invoice",
+                "expense_id": "Linked Expense ID", "invoice_path": "File",
+            }),
+            use_container_width=True, height=300, hide_index=True,
+        )
+
+        # Totals
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.metric("Total Credits", f"₹{cn_df['credit_amount'].sum():,.2f}")
+        with t2:
+            st.metric("GST Reversed", f"₹{cn_df['gst_credit'].sum():,.2f}")
+        with t3:
+            st.metric("Net Credit", f"₹{cn_df['total_credit'].sum():,.2f}")
+
+        # Delete
+        st.markdown("---")
+        del1, del2, _ = st.columns([1, 1, 3])
+        with del1:
+            del_cn_id = st.number_input("Credit Note ID to delete", min_value=1, step=1,
+                                         key="del_cn_id")
+        with del2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🗑 Delete", key="del_cn_btn"):
+                delete_credit_note(engine, int(del_cn_id))
+                st.warning(f"Credit note #{del_cn_id} deleted.")
+                st.rerun()
+
+
 def render_projects_tab(engine, df: pd.DataFrame):
     st.markdown('<div class="section-header">Project Summary</div>', unsafe_allow_html=True)
     projects = get_projects(engine)
@@ -2685,10 +3152,10 @@ def main():
     render_header()
     render_summary_cards(df)
 
-    tab_ledger, tab_scanner, tab_receipt, tab_analytics, tab_gst, tab_vendors, tab_projects, tab_restore = st.tabs([
+    tab_ledger, tab_scanner, tab_receipt, tab_cn, tab_analytics, tab_gst, tab_vendors, tab_projects, tab_restore = st.tabs([
         "📒  Ledger", "🤖  AI Scanner", "🖨️  Receipt Generator",
-        "📊  Analytics", "🧾  Tax Dashboard", "🏢  Vendors", "🏗️  Projects",
-        "♻️  Restore"
+        "🔄  Credit Notes", "📊  Analytics", "🧾  Tax Dashboard",
+        "🏢  Vendors", "🏗️  Projects", "♻️  Restore"
     ])
     with tab_ledger:
         render_accounting_table(df, engine)
@@ -2696,8 +3163,10 @@ def main():
         render_invoice_scanner_tab(engine)
     with tab_receipt:
         render_receipt_generator_tab(engine)
+    with tab_cn:
+        render_credit_notes_tab(engine)
     with tab_analytics:
-        render_analytics_tab(df)
+        render_analytics_tab(engine, df)
     with tab_gst:
         render_gst_tab(df, engine)
     with tab_vendors:
