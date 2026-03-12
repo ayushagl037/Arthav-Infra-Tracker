@@ -1896,16 +1896,17 @@ def render_invoice_scanner_tab(engine):
     if scanned_df.empty:
         st.info("No AI-scanned invoices saved yet.")
     else:
+        display_df = scanned_df[["id", "date", "project", "vendor", "category",
+                                  "description", "gross_amount", "gst_amount",
+                                  "payment_status", "invoice_path"]].copy()
+        display_df["total_amount"] = display_df["gross_amount"] + display_df["gst_amount"]
         st.dataframe(
-            scanned_df[["id", "date", "project", "vendor", "category",
-                         "description", "gross_amount", "gst_amount",
-                         "payment_status", "invoice_path"]]
-            .rename(columns={
+            display_df.rename(columns={
                 "id": "ID", "date": "Date", "project": "Project",
                 "vendor": "Vendor", "category": "Category",
                 "description": "Description", "gross_amount": "Gross (₹)",
-                "gst_amount": "GST (₹)", "payment_status": "Status",
-                "invoice_path": "File",
+                "gst_amount": "GST (₹)", "total_amount": "Total (₹)",
+                "payment_status": "Status", "invoice_path": "File",
             }),
             use_container_width=True, height=300, hide_index=True,
         )
