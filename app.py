@@ -47,13 +47,34 @@ GDRIVE_FOLDER  = "1PitNGfasNhTHGQqIyseHzTjhbnaJhUhg"
 def get_db_url() -> str:
     """
     Returns the PostgreSQL connection URL from Streamlit secrets.
+    Forces the Supabase pooler endpoint (port 6543) which works on Streamlit Cloud.
     Falls back to SQLite only if secret is missing (local dev).
     """
     try:
         url = st.secrets["supabase"]["db_url"]
-        # SQLAlchemy requires 'postgresql://' not 'postgres://'
+        # Ensure correct scheme for SQLAlchemy
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
+        # Force pooler host/port — Streamlit Cloud blocks direct connections
+        # Direct:  db.uoixjacxgxqhvmuhnuqq.supabase.co:5432
+        # Pooler:  aws-0-ap-south-1.pooler.supabase.com:6543
+        if "db.uoixjacxgxqhvmuhnuqq.supabase.co" in url:
+            url = url.replace(
+                "db.uoixjacxgxqhvmuhnuqq.supabase.co",
+                "aws-0-ap-south-1.pooler.supabase.com",
+            )
+        # Fix username format for pooler (requires postgres.PROJECT_REF)
+        if "@aws-0-ap-south-1.pooler.supabase.com" in url:
+            if "postgres.uoixjacxgxqhvmuhnuqq" not in url:
+                url = url.replace(
+                    "postgresql://postgres:",
+                    "postgresql://postgres.uoixjacxgxqhvmuhnuqq:",
+                )
+            # Force pooler port
+            url = url.replace(":5432/", ":6543/")
+            # Append pgbouncer flag if missing
+            if "pgbouncer" not in url:
+                url = url + "?pgbouncer=true"
         return url
     except Exception:
         return f"sqlite:///{DB_PATH}"
@@ -158,9 +179,14 @@ def get_engine():
         engine = create_engine(
             db_url,
             echo=False,
-            pool_pre_ping=True,        # detect stale connections
-            pool_recycle=300,          # recycle every 5 min
-            connect_args={"sslmode": "require"},
+            pool_pre_ping=True,
+            pool_recycle=300,
+            pool_size=2,
+            max_overflow=2,
+            connect_args={
+                "sslmode":        "require",
+                "connect_timeout": 10,
+            },
         )
     else:
         engine = create_engine(db_url, echo=False)
