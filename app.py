@@ -300,6 +300,26 @@ def get_receipt_expense(engine, receipt_no: str):
     return None
 
 
+def get_receipt_by_id(engine, expense_id: int):
+    """Fetch a receipt expense row by its DB ID."""
+    with Session(engine) as s:
+        e = s.query(Expense).filter(Expense.id == expense_id).first()
+        if e and e.invoice_path and "AIRC-" in e.invoice_path:
+            return {
+                "id":            e.id,
+                "date":          e.date,
+                "description":   e.description,
+                "gross_amount":  e.gross_amount,
+                "invoice_path":  e.invoice_path,
+                "drive_file_id": e.drive_file_id,
+                "vendor_id":     e.vendor_id,
+                "category_id":   e.category_id,
+                "project_id":    e.project_id,
+                "payment_status":e.payment_status,
+            }
+    return None
+
+
 def get_scanned_expense(engine, expense_id: int):
     """Fetch a scanned invoice expense row by its DB ID as a plain dict."""
     with Session(engine) as s:
@@ -2265,25 +2285,30 @@ def render_receipt_generator_tab(engine):
     # ── Edit Existing Receipt ─────────────────────────────────────
     st.markdown('<div class="section-header">Edit an Existing Receipt</div>',
                 unsafe_allow_html=True)
-    st.caption("Load a past receipt by its number, edit the details, and the PDF will be regenerated and overwritten on Google Drive.")
+    st.caption("Enter the Expense ID from the Recent Receipts table above to load and edit it.")
 
     edit_col1, edit_col2 = st.columns([2, 1])
     with edit_col1:
-        search_no = st.text_input("Enter Receipt Number to Edit",
-                                   placeholder="e.g. AIRC-2026-0001",
-                                   key="edit_receipt_search")
+        edit_receipt_id = st.number_input("Expense ID", min_value=1, step=1,
+                                           key="edit_receipt_id")
     with edit_col2:
         st.markdown("<br>", unsafe_allow_html=True)
         load_clicked = st.button("🔍 Load Receipt", key="load_receipt_btn")
 
-    if load_clicked and search_no.strip():
-        rec = get_receipt_expense(engine, search_no.strip().upper())
+    if load_clicked:
+        rec = get_receipt_by_id(engine, int(edit_receipt_id))
         if rec:
+            rec_no = ""
+            if rec["invoice_path"]:
+                # Extract AIRC-YYYY-XXXX from path
+                import re
+                match = re.search(r"AIRC-\d{4}-\d+", rec["invoice_path"])
+                rec_no = match.group(0) if match else rec["invoice_path"]
             st.session_state["editing_receipt"]    = rec
-            st.session_state["editing_receipt_no"] = search_no.strip().upper()
-            st.success(f"✅ Receipt {search_no.strip().upper()} loaded — edit below.")
+            st.session_state["editing_receipt_no"] = rec_no
+            st.success(f"✅ Receipt {rec_no} (ID #{rec['id']}) loaded — edit below.")
         else:
-            st.error(f"No receipt found matching '{search_no.strip()}'.")
+            st.error(f"No receipt found with ID #{int(edit_receipt_id)}. Make sure it's a receipt, not a scanned invoice.")
 
     if "editing_receipt" in st.session_state:
         rec    = st.session_state["editing_receipt"]
